@@ -20,3 +20,10 @@ type MemberState struct {
 	Incarnation int    // version number, bumps on state change
 	LastSeen    time.Time
 }
+
+
+type Message struct{
+	node *Node;
+	content byte;
+	counter int;
+}
