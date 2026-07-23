@@ -24,6 +24,8 @@ type Node struct {
 	queuePos    int
 	relayRequests map[uint64]*net.UDPAddr // seq -> original requester
 	relayMu       sync.Mutex
+	pendingUpdates []Update
+	updatesMu      sync.Mutex
 }
 
 type Update struct {
@@ -79,6 +81,21 @@ func (n *Node) gossipLoop() {
 	}
 	n.pingMember(target)
 }
+}
+
+
+func (n *Node) drainUpdates(max int) []Update {
+	n.updatesMu.Lock()
+	defer n.updatesMu.Unlock()
+
+	if len(n.pendingUpdates) <= max {
+		out := n.pendingUpdates
+		n.pendingUpdates = nil
+		return out
+	}
+	out := n.pendingUpdates[:max]
+	n.pendingUpdates = n.pendingUpdates[max:]
+	return out
 }
 
 func (n *Node) pickNextMember() *MemberState {
@@ -137,6 +154,7 @@ func (n *Node) pingMember(target *MemberState) {
 		MessageType: "PING",
 		From:        n.BindAddr.String(),
 		Counter:     seq,
+		Update: n.drainUpdates(6),
 	}
 	mess, err := json.Marshal(msg)
 	if err != nil {
@@ -166,15 +184,36 @@ func (n *Node) pingMember(target *MemberState) {
 		select {
 		case <-waitCh:
 			n.mu.Lock()
-			target.Status = "alive"
+			target.Status = "Alive"
 			target.LastSeen = time.Now()
+			target.Incarnation=target.Incarnation+1;
 			n.mu.Unlock()
 
 		case <-time.After(500 * time.Millisecond):
 			n.mu.Lock()
-			target.Status = "suspect"
+			target.Status = "Suspect"
+			target.Incarnation= target.Incarnation+1
 			n.mu.Unlock()
 			log.Printf("indirect ping also failed, marking %s suspect (seq %d)\n", target.Addr, seq)
+
+			select {
+			case<- waitCh:
+				n.mu.Lock()
+				target.Status = "Alive"
+				target.LastSeen = time.Now()
+				target.Incarnation=target.Incarnation+1;
+				n.mu.Unlock()
+
+			case <-time.After(3*time.Second):
+				n.mu.Lock()
+				target.Status = "Confirm"
+				target.Incarnation= target.Incarnation+1
+				n.mu.Unlock()
+				log.Printf("indirect ping also failed, marking %s suspect (seq %d)\n", target.Addr, seq)
+
+
+
+			}
 		}
 }	
 
@@ -190,6 +229,7 @@ func (n *Node) indirectPing(target *MemberState, seq uint64) {
 			From:        n.BindAddr.String(),
 			Counter:     seq,
 			IndirectTarget: target.Addr.String(),
+			Update: n.drainUpdates(6)[],
 			 // new field: who the relay should ping
 		}
 		mess, err := json.Marshal(msg)
@@ -252,6 +292,7 @@ func (n *Node) handleMessage(buf []byte, addr *net.UDPAddr) {
 		log.Println("unmarshal failed:", err)
 		return
 	}
+	n.mergeUpdates(msg.Updates)
 
 	switch msg.MessageType {
 	case "PING":
@@ -262,6 +303,39 @@ func (n *Node) handleMessage(buf []byte, addr *net.UDPAddr) {
 		n.handlePingReq(msg, addr)
 	}
 }
+
+
+func (n *Node) mergeUpdates(updates []Update) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	for _, u := range updates {
+		existing, known := n.Members[u.MemberID]
+		if !known {
+			continue // you don't know this member's address yet -- skip for now
+		}
+
+		if u.Status=="Suspect" && u.Incarnation>=existing.Incarnation{
+			existing.Status = u.Status
+			existing.Incarnation = u.Incarnation
+			continue
+
+		}
+		
+		if u.Incarnation < existing.Incarnation && u.Status!="Confirm" {
+			continue // stale info, ignore it
+		}
+		if u.Incarnation == existing.Incarnation && u.Status == existing.Status {
+			continue // nothing new
+		}
+
+		existing.Status = u.Status
+		existing.Incarnation = u.Incarnation
+	}
+}
+
+
+
 
 
 func (n *Node) handlePingReq(msg Message, requesterAddr *net.UDPAddr) {
@@ -281,6 +355,7 @@ func (n *Node) handlePingReq(msg Message, requesterAddr *net.UDPAddr) {
 		MessageType: "PING",
 		From:        n.BindAddr.String(),
 		Counter:     msg.Counter, // same seq -- this is what ties it all together
+		Update: n.drainUpdates(6)[],
 	}
 
 	mess, err := json.Marshal(reply)
