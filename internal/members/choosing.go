@@ -29,7 +29,7 @@ type Node struct {
 }
 
 type Update struct {
-	Addr string
+	MemberID string
 	Status string
 	Incarnation int
 }
@@ -50,7 +50,7 @@ type Message struct {
 	From        string // sender's own address, as a string
 	Counter     uint64 // matches a PING to its ACK
 	IndirectTarget string
-	Update Update
+	Updates []Update
 }
 
 func NewNode(id string, bindAddr *net.UDPAddr, conn *net.UDPConn) *Node {
@@ -60,6 +60,7 @@ func NewNode(id string, bindAddr *net.UDPAddr, conn *net.UDPConn) *Node {
 		Members:      make(map[string]*MemberState),
 		conn:         conn,
 		pendingPings: make(map[uint64]chan struct{}),
+		relayRequests: make(map[uint64]*net.UDPAddr),
 	}
 }
 
@@ -84,17 +85,13 @@ func (n *Node) gossipLoop() {
 }
 
 
-func (n *Node) drainUpdates(max int) []Update {
+func (n *Node) drainUpdates() []Update {
 	n.updatesMu.Lock()
 	defer n.updatesMu.Unlock()
 
-	if len(n.pendingUpdates) <= max {
-		out := n.pendingUpdates
-		n.pendingUpdates = nil
-		return out
-	}
-	out := n.pendingUpdates[:max]
-	n.pendingUpdates = n.pendingUpdates[max:]
+	
+	out := n.pendingUpdates[:]
+	
 	return out
 }
 
@@ -119,6 +116,8 @@ func (n *Node) pickNextMember() *MemberState {
 // rebuildQueue snapshots current members (excluding self) and shuffles them.
 // Called with n.mu already held.
 func (n *Node) rebuildQueue() {
+	n.updatesMu.Lock()
+	defer n.updatesMu.Unlock()
 	ids := make([]string, 0, len(n.Members))
 	for id := range n.Members {
 		if id == n.ID {
@@ -130,11 +129,20 @@ func (n *Node) rebuildQueue() {
 		ids[i], ids[j] = ids[j], ids[i]
 	})
 	n.gossipQueue = ids
+	clear(n.pendingUpdates)
 }
 
 // pingMember sends a PING to one specific member and waits (with a
 // timeout) for its ACK. This is where indirect-ping / suspicion
 // logic will eventually hook in on the timeout branch.
+
+func (n *Node) buildUpdates (status string, memberId string, incarnation int){
+	n.pendingUpdates=append(n.pendingUpdates, Update{
+		MemberID: memberId,
+		Status: status,
+		Incarnation: incarnation,
+	})
+}
 func (n *Node) pingMember(target *MemberState) {
 	seq := n.nextCounter()
 
@@ -154,7 +162,7 @@ func (n *Node) pingMember(target *MemberState) {
 		MessageType: "PING",
 		From:        n.BindAddr.String(),
 		Counter:     seq,
-		Update: n.drainUpdates(6),
+		Updates: n.drainUpdates(),
 	}
 	mess, err := json.Marshal(msg)
 	if err != nil {
@@ -171,7 +179,7 @@ func (n *Node) pingMember(target *MemberState) {
 	case <-waitCh:
 		// ACK arrived in time -- mark alive
 		n.mu.Lock()
-		target.Status = "alive"
+		target.Status = "Alive"
 		target.LastSeen = time.Now()
 		n.mu.Unlock()
 
@@ -186,13 +194,14 @@ func (n *Node) pingMember(target *MemberState) {
 			n.mu.Lock()
 			target.Status = "Alive"
 			target.LastSeen = time.Now()
-			target.Incarnation=target.Incarnation+1;
+			
 			n.mu.Unlock()
 
 		case <-time.After(500 * time.Millisecond):
 			n.mu.Lock()
 			target.Status = "Suspect"
-			target.Incarnation= target.Incarnation+1
+	
+
 			n.mu.Unlock()
 			log.Printf("indirect ping also failed, marking %s suspect (seq %d)\n", target.Addr, seq)
 
@@ -207,7 +216,7 @@ func (n *Node) pingMember(target *MemberState) {
 			case <-time.After(3*time.Second):
 				n.mu.Lock()
 				target.Status = "Confirm"
-				target.Incarnation= target.Incarnation+1
+		
 				n.mu.Unlock()
 				log.Printf("indirect ping also failed, marking %s suspect (seq %d)\n", target.Addr, seq)
 
@@ -215,7 +224,7 @@ func (n *Node) pingMember(target *MemberState) {
 
 			}
 		}
-}	
+}	}
 
 func (n *Node) indirectPing(target *MemberState, seq uint64) {
 	relays := n.pickRelays(target, 3)
@@ -229,7 +238,7 @@ func (n *Node) indirectPing(target *MemberState, seq uint64) {
 			From:        n.BindAddr.String(),
 			Counter:     seq,
 			IndirectTarget: target.Addr.String(),
-			Update: n.drainUpdates(6)[],
+			Updates: n.drainUpdates(),
 			 // new field: who the relay should ping
 		}
 		mess, err := json.Marshal(msg)
@@ -314,6 +323,11 @@ func (n *Node) mergeUpdates(updates []Update) {
 		if !known {
 			continue // you don't know this member's address yet -- skip for now
 		}
+		if u.Status=="Confirm" {
+			delete(n.Members, u.MemberID)
+			
+			
+		}
 
 		if u.Status=="Suspect" && u.Incarnation>=existing.Incarnation{
 			existing.Status = u.Status
@@ -351,11 +365,11 @@ func (n *Node) handlePingReq(msg Message, requesterAddr *net.UDPAddr) {
 	n.relayRequests[msg.Counter] = requesterAddr
 	n.relayMu.Unlock()
 
-	reply := Message{
+		reply := Message{
 		MessageType: "PING",
 		From:        n.BindAddr.String(),
 		Counter:     msg.Counter, // same seq -- this is what ties it all together
-		Update: n.drainUpdates(6)[],
+		Updates: n.drainUpdates(),
 	}
 
 	mess, err := json.Marshal(reply)
