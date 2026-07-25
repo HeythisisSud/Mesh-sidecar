@@ -35,6 +35,7 @@ type Update struct {
 }
 
 type MemberState struct {
+	ID   string
 	Addr        *net.UDPAddr
 	Status      string // "alive", "suspect", "dead"
 	Incarnation int    // version number, bumps on state change
@@ -137,6 +138,8 @@ func (n *Node) rebuildQueue() {
 // logic will eventually hook in on the timeout branch.
 
 func (n *Node) buildUpdates (status string, memberId string, incarnation int){
+	n.updatesMu.Lock()
+	defer n.updatesMu.Unlock()
 	n.pendingUpdates=append(n.pendingUpdates, Update{
 		MemberID: memberId,
 		Status: status,
@@ -200,6 +203,7 @@ func (n *Node) pingMember(target *MemberState) {
 		case <-time.After(500 * time.Millisecond):
 			n.mu.Lock()
 			target.Status = "Suspect"
+			n.buildUpdates(target.Status, target.ID, target.Incarnation)
 	
 
 			n.mu.Unlock()
@@ -210,13 +214,14 @@ func (n *Node) pingMember(target *MemberState) {
 				n.mu.Lock()
 				target.Status = "Alive"
 				target.LastSeen = time.Now()
-				target.Incarnation=target.Incarnation+1;
+				n.buildUpdates(target.Status, target.ID, target.Incarnation)
+
 				n.mu.Unlock()
 
 			case <-time.After(3*time.Second):
 				n.mu.Lock()
 				target.Status = "Confirm"
-		
+				n.buildUpdates(target.Status, target.ID, target.Incarnation)
 				n.mu.Unlock()
 				log.Printf("indirect ping also failed, marking %s suspect (seq %d)\n", target.Addr, seq)
 
@@ -289,7 +294,7 @@ func (n *Node) receiveLoop() {
 		b, senderAddr, err := n.conn.ReadFromUDP(buf)
 		if err != nil {
 			log.Println("read failed:", err)
-			continue // don't kill the whole loop on one bad read
+			continue 
 		}
 		n.handleMessage(buf[:b], senderAddr)
 	}
@@ -319,9 +324,12 @@ func (n *Node) mergeUpdates(updates []Update) {
 	defer n.mu.Unlock()
 
 	for _, u := range updates {
+		if u.MemberID == n.ID && (u.Status == "Suspect" || u.Status == "Confirm") {
+    		n.buildUpdates("Alive", n.ID, u.Incarnation+1)
+		}
 		existing, known := n.Members[u.MemberID]
 		if !known {
-			continue // you don't know this member's address yet -- skip for now
+			continue 
 		}
 		if u.Status=="Confirm" {
 			delete(n.Members, u.MemberID)
@@ -337,10 +345,10 @@ func (n *Node) mergeUpdates(updates []Update) {
 		}
 		
 		if u.Incarnation < existing.Incarnation && u.Status!="Confirm" {
-			continue // stale info, ignore it
+			continue 
 		}
 		if u.Incarnation == existing.Incarnation && u.Status == existing.Status {
-			continue // nothing new
+			continue 
 		}
 
 		existing.Status = u.Status
