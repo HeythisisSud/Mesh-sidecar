@@ -52,7 +52,19 @@ type Message struct {
 	Counter     uint64 // matches a PING to its ACK
 	IndirectTarget string
 	Updates []Update
+	Members []MemberInfo
+	JoinerID string
+	
 }
+
+
+type MemberInfo struct {
+	ID          string
+	Addr        string
+	Status      string
+	Incarnation int
+}
+
 
 func NewNode(id string, bindAddr *net.UDPAddr, conn *net.UDPConn) *Node {
 	return &Node{
@@ -72,6 +84,7 @@ func (n *Node) Start() {
 
 // gossipLoop ticks once a second and pings ONE random member.
 // This is the actual gossip round -- not a broadcast to everyone.
+
 func (n *Node) gossipLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -215,7 +228,6 @@ func (n *Node) pingMember(target *MemberState) {
 				target.Status = "Alive"
 				target.LastSeen = time.Now()
 				n.buildUpdates(target.Status, target.ID, target.Incarnation)
-
 				n.mu.Unlock()
 
 			case <-time.After(3*time.Second):
@@ -315,6 +327,8 @@ func (n *Node) handleMessage(buf []byte, addr *net.UDPAddr) {
 		n.handleAck(msg, addr)
 	case "PING-REQ":
 		n.handlePingReq(msg, addr)
+	case "JOIN":
+		n.handleJoin(msg)
 	}
 }
 
@@ -438,4 +452,52 @@ func (n *Node) handleAck(msg Message, addr *net.UDPAddr) {
 		return
 	}
 	close(waitCh)
+}
+
+
+func (n *Node) Join (peerAddr *net.UDPAddr) error{
+	reply:=Message{
+		MessageType: "JOIN",
+		From: n.BindAddr.String(),
+		JoinerID: n.ID,	
+
+	}
+
+	mess, err := json.Marshal(reply)
+	if err != nil {
+		log.Println("marshal ack failed:", err)
+		return err
+	}
+
+	
+	
+	if _, err := n.conn.WriteToUDP(mess, peerAddr); err != nil {
+		log.Println("send ack failed:", err)
+		return err
+	}
+
+	return nil
+
+
+
+
+}
+
+
+
+func (n *Node) handleJoin (msg Message){
+	JoinerAddr, err:=net.ResolveUDPAddr("udp", msg.From)
+	if err!=nil{
+		log.Println("handle join failed")
+	}
+	
+
+	reply:= MemberState{
+		ID: msg.JoinerID,
+		Addr: JoinerAddr,
+		Incarnation: 1,
+	}
+	n.Members[msg.From]= &reply
+
+
 }
