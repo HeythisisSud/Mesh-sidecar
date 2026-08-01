@@ -42,10 +42,7 @@ type MemberState struct {
 	LastSeen    time.Time
 }
 
-// Message is what actually goes over the wire.
-// Only exported fields survive json.Marshal, and only plain
-// data belongs here -- never a pointer to Node, a connection,
-// or anything else meaningful only on the local machine.
+
 type Message struct {
 	MessageType string // "PING", "ACK", etc.
 	From        string // sender's own address, as a string
@@ -492,12 +489,60 @@ func (n *Node) handleJoin (msg Message){
 	}
 	
 
-	reply:= MemberState{
+	update:= MemberState{
 		ID: msg.JoinerID,
 		Addr: JoinerAddr,
 		Incarnation: 1,
+
 	}
-	n.Members[msg.From]= &reply
+	n.Members[msg.From]= &update
+	var member MemberInfo
+	var members []MemberInfo
+	for _, value:= range n.Members{
+		member= MemberInfo{
+			ID: value.ID,
+			Status: value.Status,
+			Incarnation: value.Incarnation,
+			Addr: value.Addr.String(),
+		}
+
+		members = append(members, member)
+
+
+	}
+
+	reply:= &Message{
+		MessageType: "JOIN-ACK",
+		From: n.BindAddr.String(),
+		Members: members,
+	}
+	value, err:=json.Marshal(reply)
+	if err!=nil{
+		log.Println(err)
+	}
+
+	if _,err:=n.conn.WriteToUDP(value, JoinerAddr); err!=nil{
+		log.Println(err)
+	}
+
+
+
+}
+
+
+func (n *Node) handleJoinAck (msg Message){
+	for _, value := range msg.Members {
+		addr, err:=net.ResolveUDPAddr("udp", value.Addr)
+		if err!=nil{
+			log.Println(err)
+		}
+    	n.Members[value.ID]=&MemberState{
+			ID: value.ID,
+			Addr: addr,
+			Status: value.Status,
+			Incarnation: value.Incarnation,
+		}
+}
 
 
 }
