@@ -19,13 +19,15 @@ type Node struct {
 	pendingPings map[uint64]chan struct{}
 	pendingMu    sync.Mutex
 	counter      uint64
-
+	pendingJoin map[uint64]chan struct{}
+	pendingJoinMu  sync.Mutex
 	gossipQueue    []string // shuffled member IDs, walked in order
 	queuePos       int
 	relayRequests  map[uint64]*net.UDPAddr // seq -> original requester
 	relayMu        sync.Mutex
 	pendingUpdates []Update
 	updatesMu      sync.Mutex
+	Incarnation int
 }
 
 type Update struct {
@@ -46,6 +48,7 @@ type Message struct {
 	MessageType    string // "PING", "ACK", etc.
 	From           string // sender's own address, as a string
 	Counter        uint64 // matches a PING to its ACK
+	 	 
 	IndirectTarget string
 	Updates        []Update
 	Members        []MemberInfo
@@ -67,6 +70,8 @@ func NewNode(id string, bindAddr *net.UDPAddr, conn *net.UDPConn) *Node {
 		conn:          conn,
 		pendingPings:  make(map[uint64]chan struct{}),
 		relayRequests: make(map[uint64]*net.UDPAddr),
+		Incarnation: 0,
+		pendingJoin: make(map[uint64]chan struct{}),
 	}
 }
 
@@ -137,9 +142,7 @@ func (n *Node) rebuildQueue() {
 	clear(n.pendingUpdates)
 }
 
-// pingMember sends a PING to one specific member and waits (with a
-// timeout) for its ACK. This is where indirect-ping / suspicion
-// logic will eventually hook in on the timeout branch.
+
 
 func (n *Node) buildUpdates(status string, memberId string, incarnation int) {
 	n.updatesMu.Lock()
@@ -158,7 +161,6 @@ func (n *Node) pingMember(target *MemberState) {
 	n.pendingPings[seq] = waitCh
 	n.pendingMu.Unlock()
 
-	// always clean up the pending entry, whether we succeed or time out
 	defer func() {
 		n.pendingMu.Lock()
 		delete(n.pendingPings, seq)
@@ -184,7 +186,6 @@ func (n *Node) pingMember(target *MemberState) {
 
 	select {
 	case <-waitCh:
-		// ACK arrived in time -- mark alive
 		n.mu.Lock()
 		target.Status = "Alive"
 		target.LastSeen = time.Now()
@@ -194,7 +195,6 @@ func (n *Node) pingMember(target *MemberState) {
 
 		n.indirectPing(target, seq)
 
-		// second wait -- same waitCh, same seq, fresh timeout
 		select {
 		case <-waitCh:
 			n.mu.Lock()
@@ -244,20 +244,17 @@ func (n *Node) indirectPing(target *MemberState, seq uint64) {
 			Counter:        seq,
 			IndirectTarget: target.Addr.String(),
 			Updates:        n.drainUpdates(),
-			// new field: who the relay should ping
 		}
 		mess, err := json.Marshal(msg)
 		if err != nil {
 			continue
 		}
-		// fire-and-forget to each relay; we're already waiting on
-		// the same waitCh/timeout that pingMember set up for seq
+		
 		go n.conn.WriteToUDP(mess, relay.Addr)
 	}
 }
 
-// pickRelays grabs up to `count` random members, excluding
-// ourselves and the target. Holds the lock only briefly.
+
 func (n *Node) pickRelays(target *MemberState, count int) []*MemberState {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
@@ -315,6 +312,8 @@ func (n *Node) handleMessage(buf []byte, addr *net.UDPAddr) {
 		n.handlePingReq(msg, addr)
 	case "JOIN":
 		n.handleJoin(msg)
+	case "JOIN-ACK":
+		n.handleJoinAck(msg)
 	}
 }
 
@@ -361,8 +360,7 @@ func (n *Node) handlePingReq(msg Message, requesterAddr *net.UDPAddr) {
 		return
 	}
 
-	// remember that this seq number is a relay job, and who to
-	// forward the eventual ack back to
+	
 	n.relayMu.Lock()
 	n.relayRequests[msg.Counter] = requesterAddr
 	n.relayMu.Unlock()
@@ -370,7 +368,7 @@ func (n *Node) handlePingReq(msg Message, requesterAddr *net.UDPAddr) {
 	reply := Message{
 		MessageType: "PING",
 		From:        n.BindAddr.String(),
-		Counter:     msg.Counter, // same seq -- this is what ties it all together
+		Counter:     msg.Counter, 
 		Updates:     n.drainUpdates(),
 	}
 
@@ -435,10 +433,24 @@ func (n *Node) handleAck(msg Message, addr *net.UDPAddr) {
 }
 
 func (n *Node) Join(peerAddr *net.UDPAddr) error {
+
+	seq := n.nextCounter()
+
+	waitCh := make(chan struct{})
+	n.pendingJoinMu.Lock()
+	n.pendingJoin[seq] = waitCh
+	n.pendingJoinMu.Unlock()
+
+	defer func() {
+		n.pendingJoinMu.Lock()
+		delete(n.pendingJoin, seq)
+		n.pendingJoinMu.Unlock()
+	}()
 	reply := Message{
 		MessageType: "JOIN",
 		From:        n.BindAddr.String(),
 		JoinerID:    n.ID,
+		Counter: seq,
 	}
 
 	mess, err := json.Marshal(reply)
@@ -452,7 +464,17 @@ func (n *Node) Join(peerAddr *net.UDPAddr) error {
 		return err
 	}
 
-	return nil
+	select{
+
+	case<-waitCh:
+		return nil
+	case<-time.After(3 * time.Second):
+		return nil
+		//logic to change the master node 
+		//MASTER node is something whom we send a join request to
+
+
+	}
 
 }
 
@@ -462,7 +484,7 @@ func (n *Node) handleJoin(msg Message) {
 		log.Println("handle join failed")
 	}
 
-	update := MemberState{
+	state := MemberState{
 		ID:          msg.JoinerID,
 		Addr:        JoinerAddr,
 		Incarnation: 1,
@@ -471,7 +493,7 @@ func (n *Node) handleJoin(msg Message) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	n.Members[msg.JoinerID] = &update
+	n.Members[msg.JoinerID] = &state
 	
 	var member MemberInfo
 	var members []MemberInfo
@@ -486,11 +508,19 @@ func (n *Node) handleJoin(msg Message) {
 		members = append(members, member)
 
 	}
+	members = append(members, MemberInfo{
+    ID:          n.ID,
+    Status:      "Alive",
+    Incarnation: n.Incarnation, // or track your own incarnation if you have one
+    Addr:        n.BindAddr.String(),
+	})
 
 	reply := &Message{
 		MessageType: "JOIN-ACK",
 		From:        n.BindAddr.String(),
 		Members:     members,
+		JoinerID: n.ID,
+		Counter: msg.Counter,
 	}
 	value, err := json.Marshal(reply)
 	if err != nil {
@@ -500,6 +530,19 @@ func (n *Node) handleJoin(msg Message) {
 	if _, err := n.conn.WriteToUDP(value, JoinerAddr); err != nil {
 		log.Println(err)
 	}
+
+	update:= Update{
+		MemberID: msg.JoinerID,
+		Status: "Alive",
+		Incarnation: 0,
+	}
+
+	n.updatesMu.Lock()
+	defer n.updatesMu.Unlock()
+
+	n.pendingUpdates = append(n.pendingUpdates, update)
+	
+
 
 }
 
@@ -518,5 +561,16 @@ func (n *Node) handleJoinAck(msg Message) {
 			Incarnation: value.Incarnation,
 		}
 	}
+	n.pendingJoinMu.Lock()
+	defer n.pendingJoinMu.Unlock()
+
+	waitCh, ok:= n.pendingJoin[msg.Counter]
+	if !ok{
+		return
+	}
+	close(waitCh)
+	
+
+	
 
 }
