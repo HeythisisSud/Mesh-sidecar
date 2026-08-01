@@ -2,6 +2,7 @@ package members
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"math/rand"
 	"net"
@@ -323,7 +324,9 @@ func (n *Node) mergeUpdates(updates []Update) {
 
 	for _, u := range updates {
 		if u.MemberID == n.ID && (u.Status == "Suspect" || u.Status == "Confirm") {
-			n.buildUpdates("Alive", n.ID, u.Incarnation+1)
+			n.Incarnation=u.Incarnation+1
+			n.buildUpdates("Alive", n.ID, n.Incarnation)
+			
 		}
 		existing, known := n.Members[u.MemberID]
 		if !known {
@@ -331,6 +334,7 @@ func (n *Node) mergeUpdates(updates []Update) {
 		}
 		if u.Status == "Confirm" {
 			delete(n.Members, u.MemberID)
+			continue
 
 		}
 
@@ -469,7 +473,7 @@ func (n *Node) Join(peerAddr *net.UDPAddr) error {
 	case<-waitCh:
 		return nil
 	case<-time.After(3 * time.Second):
-		return nil
+		return errors.New("timeout")
 		//logic to change the master node 
 		//MASTER node is something whom we send a join request to
 
@@ -482,6 +486,7 @@ func (n *Node) handleJoin(msg Message) {
 	JoinerAddr, err := net.ResolveUDPAddr("udp", msg.From)
 	if err != nil {
 		log.Println("handle join failed")
+		return
 	}
 
 	state := MemberState{
