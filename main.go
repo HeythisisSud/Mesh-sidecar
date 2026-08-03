@@ -1,16 +1,16 @@
 package main
 
-
 import (
 	"bufio"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
-	"time"
 
 	"github.com/HeythisisSud/mesh-sidecar/members"
+	"github.com/HeythisisSud/mesh-sidecar/proxy"
 )
 
 func main() {
@@ -37,7 +37,29 @@ func main() {
 	node := members.NewNode(*id, bindAddr, conn)
 	node.Start()
 
-	fmt.Printf("node %q listening on %s\n", *id, *bind)
+	appPort := bindAddr.Port + 1000
+	go func() {
+		err := http.ListenAndServe(fmt.Sprintf(":%d", appPort), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("hello from " + *id))
+		}))
+		if err != nil {
+			log.Printf("app server failed: %v", err)
+		}
+	}()
+
+	proxyHandler, err := proxy.NewProxy(node)
+	if err != nil {
+		log.Fatalf("failed to create proxy: %v", err)
+	}
+	proxyPort := bindAddr.Port + 2000
+	go func() {
+		err := http.ListenAndServe(fmt.Sprintf(":%d", proxyPort), proxyHandler)
+		if err != nil {
+			log.Printf("proxy server failed: %v", err)
+		}
+	}()
+
+	fmt.Printf("node %q listening on %s (app: %d, proxy: %d)\n", *id, *bind, appPort, proxyPort)
 
 	// If a --join address was given, attempt to join that cluster.
 	if *join != "" {
@@ -74,14 +96,15 @@ func main() {
 }
 
 func printMembers(node *members.Node) {
+	members:=node.SnapShot()
+	for _, value:= range  members{
+		fmt.Println(value)
+	}
+
+
 	// NOTE: this reaches into node.Members directly for a quick test view.
 	// Since Members isn't guarded by a public accessor yet, this only
 	// works because it's in the same process — a real CLI/API would need
 	// an exported, lock-protected method on Node for this.
-	fmt.Println("---")
-	for id, m := range node.Members {
-		fmt.Printf("  %-10s %-20s status=%-8s incarnation=%d last_seen=%s\n",
-			id, m.Addr.String(), m.Status, m.Incarnation, m.LastSeen.Format(time.Kitchen))
-	}
-	fmt.Println("---")
+
 }

@@ -81,6 +81,18 @@ func (n *Node) Start() {
 	go n.gossipLoop()
 }
 
+
+func (n *Node) SnapShot() []MemberState{
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var list []MemberState
+	for _, value:= range n.Members{
+		list = append(list, *value)
+	}
+
+	return list
+
+}
 // gossipLoop ticks once a second and pings ONE random member.
 // This is the actual gossip round -- not a broadcast to everyone.
 
