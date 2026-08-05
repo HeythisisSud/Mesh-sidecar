@@ -296,8 +296,7 @@ func (n *Node) nextCounter() uint64 {
 }
 
 func (n *Node) receiveLoop() {
-	buf := make([]byte, 1500)
-
+	buf := make([]byte, 65535) // max theoretical UDP payload size
 	for {
 		b, senderAddr, err := n.conn.ReadFromUDP(buf)
 		if err != nil {
