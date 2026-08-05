@@ -123,7 +123,16 @@ func main() {
 // redirect map so the kernel knows where to forward connections.
 func syncRedirectMap(r *meshebpf.Redirector, node *members.Node) {
 	snapshot := node.SnapShot()
+
+	// build a list of alive members only
+	var alive []members.MemberState
 	for _, m := range snapshot {
+		if m.Status == "Alive" {
+			alive = append(alive, m)
+		}
+	}
+
+	for i, m := range snapshot {
 		host, portStr, err := net.SplitHostPort(m.Addr.String())
 		if err != nil {
 			continue
@@ -133,22 +142,60 @@ func syncRedirectMap(r *meshebpf.Redirector, node *members.Node) {
 			continue
 		}
 		appPort := uint16(gossipPort + 1000)
-		ip := net.ParseIP(host)
-		if ip == nil {
+
+		if m.Status != "Alive" {
+			// dead or suspect -- remove from BPF map so kernel
+			// stops routing connections to this member
+			if err := r.RemoveTarget(appPort); err != nil {
+				log.Printf("remove redirect %s: %v", m.ID, err)
+			}
 			continue
 		}
 
-		if m.Status == "Alive" {
-			if err := r.SetTarget(appPort, ip, appPort); err != nil {
-				log.Printf("failed to set redirect for %s: %v", m.ID, err)
+		// pick a different alive member as the redirect target
+		// using round-robin rotation based on this member's index
+		if len(alive) < 2 {
+			// only one alive member -- no one else to redirect to,
+			// point it at itself so connections still work
+			ip := net.ParseIP(host)
+			if ip != nil {
+				r.SetTarget(appPort, ip, appPort)
 			}
+			continue
+		}
+
+		// pick the next alive member in the list, skipping self
+		var target *members.MemberState
+		for j := 1; j <= len(alive); j++ {
+			candidate := alive[(i+j)%len(alive)]
+			if candidate.ID != m.ID {
+				target = &candidate
+				break
+			}
+		}
+		if target == nil {
+			continue
+		}
+
+		targetHost, targetPortStr, err := net.SplitHostPort(target.Addr.String())
+		if err != nil {
+			continue
+		}
+		targetGossipPort, err := strconv.Atoi(targetPortStr)
+		if err != nil {
+			continue
+		}
+		targetAppPort := uint16(targetGossipPort + 1000)
+		targetIP := net.ParseIP(targetHost)
+		if targetIP == nil {
+			continue
+		}
+
+		if err := r.SetTarget(appPort, targetIP, targetAppPort); err != nil {
+			log.Printf("set redirect %s → %s: %v", m.ID, target.ID, err)
 		} else {
-			// member is Suspect or Confirm -- remove from BPF map
-			// so no new connections get redirected to it
-			if err := r.RemoveTarget(appPort); err != nil {
-				// ignore "key not found" -- it may already be gone
-				log.Printf("failed to remove redirect for %s: %v", m.ID, err)
-			}
+			log.Printf("redirect: connections to :%d → %s:%d (%s)",
+				appPort, targetHost, targetAppPort, target.ID)
 		}
 	}
 }
