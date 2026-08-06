@@ -19,17 +19,21 @@ struct {
 
 SEC("cgroup/connect4")
 int redirect_connect(struct bpf_sock_addr *ctx) {
-    __u32 orig_port = ctx->user_port;
+    // Only intercept connections to 127.0.0.1
+    // user_ip4 is in network byte order as little-endian: 127.0.0.1 = 0x0100007F
+    if (ctx->user_ip4 != 0x0100007F) {
+        return 1;
+    }
 
-    struct redirect_target *target = bpf_map_lookup_elem(&redirect_map, &orig_port);
+    __u32 port = bpf_ntohs((__u16)(ctx->user_port));
+    struct redirect_target *target = bpf_map_lookup_elem(&redirect_map, &port);
     if (!target) {
         return 1;
     }
 
+    bpf_printk("redirecting %d -> 0x%x:0x%x\n", port, target->ip, target->port);
     ctx->user_ip4  = target->ip;
     ctx->user_port = target->port;
-
     return 1;
 }
-
 char _license[] SEC("license") = "GPL";

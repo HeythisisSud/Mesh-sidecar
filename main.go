@@ -8,9 +8,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	
 
 	meshebpf "github.com/HeythisisSud/mesh-sidecar/ebpf"
 	"github.com/HeythisisSud/mesh-sidecar/members"
@@ -69,26 +71,28 @@ func main() {
 	// L4 eBPF redirector -- Phase 3, optional via --ebpf flag
 	var redirector *meshebpf.Redirector
 	if *useEBPF {
-		cgroupPath, err := meshebpf.DefaultCgroupPath()
-		if err != nil {
-			log.Fatalf("cgroup not found: %v", err)
-		}
-		redirector, err = meshebpf.NewRedirector(cgroupPath)
-		if err != nil {
-			log.Fatalf("failed to create eBPF redirector: %v", err)
-		}
-		defer redirector.Close()
-		log.Println("eBPF L4 redirector attached")
+    cgroupPath, err := meshebpf.DefaultCgroupPath()
+    if err != nil {
+        log.Fatalf("cgroup not found: %v", err)
+    }
 
-		// sync membership into BPF map every second
-		go func() {
-			ticker := time.NewTicker(1 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				syncRedirectMap(redirector, node)
-			}
-		}()
-	}
+    redirector, err = meshebpf.NewRedirector(cgroupPath)
+    if err != nil {
+    log.Fatalf("failed to create eBPF redirector: %v", err)
+} else {
+        defer redirector.Close()
+        log.Println("eBPF redirector attached -- this node owns the BPF map")
+
+        // only the owning node syncs the map
+        go func() {
+            ticker := time.NewTicker(1 * time.Second)
+            defer ticker.Stop()
+            for range ticker.C {
+                syncRedirectMap(redirector, node)
+            }
+        }()
+    }
+}
 
 	fmt.Printf("node %q listening on %s (app: %d, proxy: %d)\n", *id, *bind, appPort, proxyPort)
 
@@ -122,82 +126,60 @@ func main() {
 // syncRedirectMap pushes the current alive member list into the BPF
 // redirect map so the kernel knows where to forward connections.
 func syncRedirectMap(r *meshebpf.Redirector, node *members.Node) {
-	snapshot := node.SnapShot()
+    snapshot := node.SnapShot()
 
-	// build a list of alive members only
-	var alive []members.MemberState
-	for _, m := range snapshot {
-		if m.Status == "Alive" {
-			alive = append(alive, m)
-		}
-	}
+    var alive []members.MemberState
+    for _, m := range snapshot {
+        if m.Status == "Alive" {
+            alive = append(alive, m)
+        }
+    }
+    // add self
+    alive = append(alive, members.MemberState{
+        ID:     node.ID,
+        Addr:   node.BindAddr,
+        Status: "Alive",
+    })
+    sort.Slice(alive, func(i, j int) bool {
+        return alive[i].ID < alive[j].ID
+    })
 
-	for i, m := range snapshot {
-		host, portStr, err := net.SplitHostPort(m.Addr.String())
-		if err != nil {
-			continue
-		}
-		gossipPort, err := strconv.Atoi(portStr)
-		if err != nil {
-			continue
-		}
-		appPort := uint16(gossipPort + 1000)
+	    log.Printf("DEBUG alive list (%d nodes):", len(alive))
 
-		if m.Status != "Alive" {
-			// dead or suspect -- remove from BPF map so kernel
-			// stops routing connections to this member
-			if err := r.RemoveTarget(appPort); err != nil {
-				log.Printf("remove redirect %s: %v", m.ID, err)
-			}
-			continue
-		}
 
-		// pick a different alive member as the redirect target
-		// using round-robin rotation based on this member's index
-		if len(alive) < 2 {
-			// only one alive member -- no one else to redirect to,
-			// point it at itself so connections still work
-			ip := net.ParseIP(host)
-			if ip != nil {
-				r.SetTarget(appPort, ip, appPort)
-			}
-			continue
-		}
+    // remove dead entries
+    for _, m := range snapshot {
+        if m.Status != "Alive" {
+            _, portStr, _ := net.SplitHostPort(m.Addr.String())
+            gossipPort, _ := strconv.Atoi(portStr)
+            r.RemoveTarget(uint16(gossipPort + 1000))
+        }
+    }
 
-		// pick the next alive member in the list, skipping self
-		var target *members.MemberState
-		for j := 1; j <= len(alive); j++ {
-			candidate := alive[(i+j)%len(alive)]
-			if candidate.ID != m.ID {
-				target = &candidate
-				break
-			}
-		}
-		if target == nil {
-			continue
-		}
+    if len(alive) < 2 {
+        return
+    }
 
-		targetHost, targetPortStr, err := net.SplitHostPort(target.Addr.String())
-		if err != nil {
-			continue
-		}
-		targetGossipPort, err := strconv.Atoi(targetPortStr)
-		if err != nil {
-			continue
-		}
-		targetAppPort := uint16(targetGossipPort + 1000)
-		targetIP := net.ParseIP(targetHost)
-		if targetIP == nil {
-			continue
-		}
+    // write ALL entries -- A→B, B→C, C→A
+    for i, m := range alive {
+        target := alive[(i+1)%len(alive)]
 
-		if err := r.SetTarget(appPort, targetIP, targetAppPort); err != nil {
-			log.Printf("set redirect %s → %s: %v", m.ID, target.ID, err)
-		} else {
-			log.Printf("redirect: connections to :%d → %s:%d (%s)",
-				appPort, targetHost, targetAppPort, target.ID)
-		}
-	}
+        _, srcPortStr, _ := net.SplitHostPort(m.Addr.String())
+        srcGossipPort, _ := strconv.Atoi(srcPortStr)
+        srcAppPort := uint16(srcGossipPort + 1000)
+
+        targetHost, targetPortStr, _ := net.SplitHostPort(target.Addr.String())
+        targetGossipPort, _ := strconv.Atoi(targetPortStr)
+        targetAppPort := uint16(targetGossipPort + 1000)
+        targetIP := net.ParseIP(targetHost)
+
+        if err := r.SetTarget(srcAppPort, targetIP, targetAppPort); err != nil {
+            log.Printf("set redirect %s→%s: %v", m.ID, target.ID, err)
+        } else {
+            log.Printf("redirect: :%d → %s:%d (%s)",
+                srcAppPort, targetHost, targetAppPort, target.ID)
+        }
+    }
 }
 
 func printMembers(node *members.Node) {
