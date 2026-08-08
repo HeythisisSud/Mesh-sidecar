@@ -85,12 +85,12 @@ func main() {
 
         // only the owning node syncs the map
         go func() {
-            ticker := time.NewTicker(1 * time.Second)
-            defer ticker.Stop()
-            for range ticker.C {
-                syncRedirectMap(redirector, node)
-            }
-        }()
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
+    for range ticker.C {
+        syncRedirectMap(redirector, node, *id, bindAddr)
+    }
+}()
     }
 }
 
@@ -125,61 +125,63 @@ func main() {
 
 // syncRedirectMap pushes the current alive member list into the BPF
 // redirect map so the kernel knows where to forward connections.
-func syncRedirectMap(r *meshebpf.Redirector, node *members.Node) {
-    snapshot := node.SnapShot()
+func syncRedirectMap(r *meshebpf.Redirector, node *members.Node, selfID string, selfAddr *net.UDPAddr) {
+	snapshot := node.SnapShot()
 
-    var alive []members.MemberState
-    for _, m := range snapshot {
-        if m.Status == "Alive" {
-            alive = append(alive, m)
-        }
+	// build alive list including self
+	alive := []members.MemberState{{
+		ID:     selfID,
+		Addr:   selfAddr,
+		Status: "Alive",
+	}}
+	for _, m := range snapshot {
+		if m.Status == "Alive" {
+			alive = append(alive, m)
+		}
+	}
+	sort.Slice(alive, func(i, j int) bool {
+		return alive[i].ID < alive[j].ID
+	})
+
+	// remove dead members from map
+	for _, m := range snapshot {
+		if m.Status != "Alive" {
+			_, portStr, _ := net.SplitHostPort(m.Addr.String())
+			gossipPort, _ := strconv.Atoi(portStr)
+			r.RemoveTarget(uint16(gossipPort + 1000))
+		}
+	}
+
+	if len(alive) < 2 {
+		return
+	}
+
+	// each node only installs its OWN redirect entry to avoid loops:
+	// when curl hits port 9001 after being redirected, the hook finds
+	// no entry for 9001 in node A's map and lets it through
+	// write ALL entries -- A→B, B→C, C→A
+for i, m := range alive {
+    target := alive[(i+1)%len(alive)]
+
+    _, srcPortStr, _ := net.SplitHostPort(m.Addr.String())
+    srcGossipPort, _ := strconv.Atoi(srcPortStr)
+    srcAppPort := uint16(srcGossipPort + 1000)
+
+    targetHost, targetPortStr, _ := net.SplitHostPort(target.Addr.String())
+    targetGossipPort, _ := strconv.Atoi(targetPortStr)
+    targetAppPort := uint16(targetGossipPort + 1000)
+    targetIP := net.ParseIP(targetHost)
+    if targetIP == nil {
+        continue
     }
-    // add self
-    alive = append(alive, members.MemberState{
-        ID:     node.ID,
-        Addr:   node.BindAddr,
-        Status: "Alive",
-    })
-    sort.Slice(alive, func(i, j int) bool {
-        return alive[i].ID < alive[j].ID
-    })
 
-	    log.Printf("DEBUG alive list (%d nodes):", len(alive))
-
-
-    // remove dead entries
-    for _, m := range snapshot {
-        if m.Status != "Alive" {
-            _, portStr, _ := net.SplitHostPort(m.Addr.String())
-            gossipPort, _ := strconv.Atoi(portStr)
-            r.RemoveTarget(uint16(gossipPort + 1000))
-        }
+    if err := r.SetTarget(srcAppPort, targetIP, targetAppPort); err != nil {
+        log.Printf("set redirect %s→%s: %v", m.ID, target.ID, err)
+    } else {
+        log.Printf("redirect: :%d → %s:%d (%s)",
+            srcAppPort, targetHost, targetAppPort, target.ID)
     }
-
-    if len(alive) < 2 {
-        return
-    }
-
-    // write ALL entries -- A→B, B→C, C→A
-    for i, m := range alive {
-        target := alive[(i+1)%len(alive)]
-
-        _, srcPortStr, _ := net.SplitHostPort(m.Addr.String())
-        srcGossipPort, _ := strconv.Atoi(srcPortStr)
-        srcAppPort := uint16(srcGossipPort + 1000)
-
-        targetHost, targetPortStr, _ := net.SplitHostPort(target.Addr.String())
-        targetGossipPort, _ := strconv.Atoi(targetPortStr)
-        targetAppPort := uint16(targetGossipPort + 1000)
-        targetIP := net.ParseIP(targetHost)
-
-        if err := r.SetTarget(srcAppPort, targetIP, targetAppPort); err != nil {
-            log.Printf("set redirect %s→%s: %v", m.ID, target.ID, err)
-        } else {
-            log.Printf("redirect: :%d → %s:%d (%s)",
-                srcAppPort, targetHost, targetAppPort, target.ID)
-        }
-    }
+}
 }
 
 func printMembers(node *members.Node) {
