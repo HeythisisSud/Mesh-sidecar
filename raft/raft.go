@@ -65,9 +65,7 @@ func NewNode(id string, peers []string, applyCh chan LogEntry) *Node {
 	return n
 }
 
-// resetElectionTimeout sets a random timeout between 150-300ms.
-// Randomness is critical -- if all nodes had the same timeout
-// they would all start elections simultaneously and split votes forever.
+
 func (n *Node) resetElectionTimeout() {
 	n.electionTimeout = time.Duration(150+rand.Intn(150)) * time.Millisecond
 	n.lastHeartbeat = time.Now()
@@ -77,8 +75,7 @@ func (n *Node) Start() {
 	go n.electionLoop()
 }
 
-// electionLoop runs forever, checking whether the election
-// timeout has elapsed and starting an election if so.
+
 func (n *Node) electionLoop() {
 	for {
 		n.mu.Lock()
@@ -119,7 +116,7 @@ func (n *Node) startElection() {
 
 	log.Printf("[%s] starting election for term %d", n.id, term)
 
-	votes := 1 // vote for self
+	votes := 1 
 	voteMu := sync.Mutex{}
 
 	for _, peer := range peers {
@@ -134,7 +131,7 @@ func (n *Node) startElection() {
 			currentVotes := votes
 			voteMu.Unlock()
 
-			// majority = (total nodes / 2) + 1
+			
 			majority := (len(peers)+1)/2 + 1
 			if currentVotes >= majority {
 				n.becomeLeader(term)
