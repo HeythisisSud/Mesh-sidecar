@@ -44,6 +44,18 @@ func main() {
 	node := members.NewNode(*id, bindAddr, conn)
 	node.Start()
 
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+	    <-sigCh
+	    fmt.Println("\nshutting down...")
+	    if redirector != nil {
+	        redirector.Close()
+	    }
+	    conn.Close()
+	    os.Exit(0)
+	}()
+
 	// fake app backend -- represents "the real service" on this node
 	appPort := bindAddr.Port + 1000
 	go func() {
@@ -92,6 +104,15 @@ func main() {
     }
 }()
     }
+	statusPort := bindAddr.Port + 3000
+go func() {
+    http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+        snapshot := node.SnapShot()
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(snapshot)
+    })
+    http.ListenAndServe(fmt.Sprintf(":%d", statusPort), nil)
+}()
 }
 
 	fmt.Printf("node %q listening on %s (app: %d, proxy: %d)\n", *id, *bind, appPort, proxyPort)

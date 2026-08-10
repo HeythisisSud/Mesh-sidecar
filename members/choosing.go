@@ -40,10 +40,16 @@ type Update struct {
 type MemberState struct {
 	ID          string
 	Addr        *net.UDPAddr
-	Status      string // "alive", "suspect", "dead"
+	Status      string // StatusAlive, StatusSuspect, "dead"
 	Incarnation int    // version number, bumps on state change
 	LastSeen    time.Time
 }
+
+const (
+    StatusAlive   = "Alive"
+    StatusSuspect = "Suspect"
+    StatusConfirm = "Confirm"
+)
 
 type Message struct {
 	MessageType    string // "PING", "ACK", etc.
@@ -200,7 +206,7 @@ func (n *Node) pingMember(target *MemberState) {
 	select {
 	case <-waitCh:
 		n.mu.Lock()
-		target.Status = "Alive"
+		target.Status = StatusAlive
 		target.LastSeen = time.Now()
 		n.mu.Unlock()
 
@@ -211,14 +217,14 @@ func (n *Node) pingMember(target *MemberState) {
 		select {
 		case <-waitCh:
 			n.mu.Lock()
-			target.Status = "Alive"
+			target.Status = StatusAlive
 			target.LastSeen = time.Now()
 
 			n.mu.Unlock()
 
 		case <-time.After(500 * time.Millisecond):
 			n.mu.Lock()
-			target.Status = "Suspect"
+			target.Status = StatusSuspect
 			n.buildUpdates(target.Status, target.ID, target.Incarnation)
 
 			n.mu.Unlock()
@@ -227,14 +233,14 @@ func (n *Node) pingMember(target *MemberState) {
 			select {
 			case <-waitCh:
 				n.mu.Lock()
-				target.Status = "Alive"
+				target.Status = StatusAlive
 				target.LastSeen = time.Now()
 				n.buildUpdates(target.Status, target.ID, target.Incarnation)
 				n.mu.Unlock()
 
 			case <-time.After(3 * time.Second):
 				n.mu.Lock()
-				target.Status = "Confirm"
+				target.Status = StatusConfirm
 				n.buildUpdates(target.Status, target.ID, target.Incarnation)
 				n.mu.Unlock()
 				log.Printf("indirect ping also failed, marking %s suspect (seq %d)\n", target.Addr, seq)
@@ -334,29 +340,29 @@ func (n *Node) mergeUpdates(updates []Update) {
 	defer n.mu.Unlock()
 
 	for _, u := range updates {
-		if u.MemberID == n.ID && (u.Status == "Suspect" || u.Status == "Confirm") {
+		if u.MemberID == n.ID && (u.Status == StatusSuspect || u.Status == StatusConfirm) {
 			n.Incarnation=u.Incarnation+1
-			n.buildUpdates("Alive", n.ID, n.Incarnation)
+			n.buildUpdates(StatusAlive, n.ID, n.Incarnation)
 			
 		}
 		existing, known := n.Members[u.MemberID]
 		if !known {
 			continue
 		}
-		if u.Status == "Confirm" {
+		if u.Status == StatusConfirm {
 			delete(n.Members, u.MemberID)
 			continue
 
 		}
 
-		if u.Status == "Suspect" && u.Incarnation >= existing.Incarnation {
+		if u.Status == StatusSuspect && u.Incarnation >= existing.Incarnation {
 			existing.Status = u.Status
 			existing.Incarnation = u.Incarnation
 			continue
 
 		}
 
-		if u.Incarnation < existing.Incarnation && u.Status != "Confirm" {
+		if u.Incarnation < existing.Incarnation && u.Status != StatusConfirm {
 			continue
 		}
 		if u.Incarnation == existing.Incarnation && u.Status == existing.Status {
@@ -504,7 +510,7 @@ func (n *Node) handleJoin(msg Message) {
 		ID:          msg.JoinerID,
 		Addr:        JoinerAddr,
 		Incarnation: 1,
-		Status: "Alive",
+		Status: StatusAlive,
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -526,7 +532,7 @@ func (n *Node) handleJoin(msg Message) {
 	}
 	members = append(members, MemberInfo{
     ID:          n.ID,
-    Status:      "Alive",
+    Status:      StatusAlive,
     Incarnation: n.Incarnation, // or track your own incarnation if you have one
     Addr:        n.BindAddr.String(),
 	})
@@ -549,7 +555,7 @@ func (n *Node) handleJoin(msg Message) {
 
 	update:= Update{
 		MemberID: msg.JoinerID,
-		Status: "Alive",
+		Status: StatusAlive,
 		Incarnation: 0,
 	}
 
