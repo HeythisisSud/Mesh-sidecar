@@ -44,22 +44,24 @@ type Node struct {
 	lastHeartbeat   time.Time
 
 	// channel to notify when a command is committed
-	applyCh chan LogEntry
+	ApplyCh chan LogEntry
+	done chan struct{}
 }
 
-func NewNode(id string, peers []string, applyCh chan LogEntry) *Node {
+func NewNode(id string, peers []string) *Node {
 	n := &Node{
-		id:            id,
-		peers:         peers,
-		currentTerm:   0,
-		votedFor:      "",
-		log:           make([]LogEntry, 0),
-		commitIndex:   0,
-		lastApplied:   0,
-		nextIndex:     make(map[string]uint64),
-		matchIndex:    make(map[string]uint64),
-		state:         Follower,
-		applyCh:       applyCh,
+		id:          id,
+		peers:       peers,
+		currentTerm: 0,
+		votedFor:    "",
+		log:         make([]LogEntry, 0),
+		commitIndex: 0,
+		lastApplied: 0,
+		nextIndex:   make(map[string]uint64),
+		matchIndex:  make(map[string]uint64),
+		state:       Follower,
+		ApplyCh:     make(chan LogEntry, 100),
+		done:        make(chan struct{}),
 	}
 	n.resetElectionTimeout()
 	return n
@@ -78,6 +80,12 @@ func (n *Node) Start() {
 
 func (n *Node) electionLoop() {
 	for {
+		select {
+		case <-n.done:
+			return
+		default:
+		}
+
 		n.mu.Lock()
 		state := n.state
 		elapsed := time.Since(n.lastHeartbeat)
@@ -90,7 +98,6 @@ func (n *Node) electionLoop() {
 				n.startElection()
 			}
 		case Leader:
-			// leader sends heartbeats, doesn't wait for election timeout
 			n.sendHeartbeats()
 			time.Sleep(50 * time.Millisecond)
 			continue
@@ -99,7 +106,6 @@ func (n *Node) electionLoop() {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
-
 // startElection transitions this node to Candidate,
 // increments its term, votes for itself, and sends
 // RequestVote RPCs to all peers.
@@ -177,4 +183,97 @@ func (n *Node) stepDown(term uint64) {
 	n.state = Follower
 	n.votedFor = ""
 	n.resetElectionTimeout()
+}
+
+// add this to raft/raft.go
+func (n *Node) Status() (state string, term uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	switch n.state {
+	case Leader:
+		return "Leader", n.currentTerm
+	case Candidate:
+		return "Candidate", n.currentTerm
+	default:
+		return "Follower", n.currentTerm
+	}
+}
+
+
+func (n *Node) Stop() {
+	close(n.done)
+}
+
+// Submit proposes a new command to the Raft cluster.
+// Only works if this node is the leader.
+// Returns the log index the entry was assigned, and whether
+// this node is actually the leader.
+func (n *Node) Submit(command string) (uint64, bool) {
+	n.mu.Lock()
+	if n.state != Leader {
+		n.mu.Unlock()
+		return 0, false
+	}
+
+	entry := LogEntry{Term: n.currentTerm, Command: command}
+	n.log = append(n.log, entry)
+	index := uint64(len(n.log))
+	term := n.currentTerm
+	peers := n.peers
+	commitIndex := n.commitIndex
+
+	log.Printf("[%s] submitted command %q at index %d term %d",
+		n.id, command, index, term)
+	n.mu.Unlock()
+
+	// confirmCh receives one message per peer that confirms replication
+	confirmCh := make(chan bool, len(peers))
+
+	for _, peer := range peers {
+		go func(peer string) {
+			success := n.callAppendEntries(peer, term, commitIndex, []LogEntry{entry})
+			if success {
+				n.mu.Lock()
+				if index > n.matchIndex[peer] {
+					n.matchIndex[peer] = index
+					n.nextIndex[peer] = index + 1
+				}
+				n.mu.Unlock()
+			}
+			confirmCh <- success
+		}(peer)
+	}
+
+	// wait for majority -- we already have 1 (ourselves)
+	majority := (len(peers)+1)/2 + 1
+	confirmed := 1
+	responded := 0
+
+	timeout := time.After(2 * time.Second)
+	for confirmed < majority && responded < len(peers) {
+		select {
+		case ok := <-confirmCh:
+			responded++
+			if ok {
+				confirmed++
+			}
+		case <-timeout:
+			log.Printf("[%s] Submit timed out waiting for majority", n.id)
+			return 0, false
+		}
+	}
+
+	if confirmed < majority {
+		return 0, false
+	}
+
+	n.mu.Lock()
+	if n.currentTerm == term && index > n.commitIndex {
+		n.commitIndex = index
+		go n.applyCommitted()
+	}
+	n.mu.Unlock()
+
+	log.Printf("[%s] committed command %q at index %d", n.id, command, index)
+	return index, true
 }

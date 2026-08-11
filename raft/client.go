@@ -101,12 +101,15 @@ func (n *Node) callAppendEntries(peer string, term, commitIndex uint64, entries 
 		n.stepDown(resp.Term)
 		return false
 	}
+	if len(entries) > 0 {
+    log.Printf("[%s] callAppendEntries to %s: success=%v", n.id, peer, resp.Success)
+}
 
 	return resp.Success
 }
 
 // applyCommitted applies all committed but not yet applied log entries
-// to the state machine via applyCh.
+// to the state machine via ApplyCh.
 func (n *Node) applyCommitted() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -114,6 +117,6 @@ func (n *Node) applyCommitted() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
 		entry := n.log[n.lastApplied-1]
-		n.applyCh <- entry
+		n.ApplyCh <- entry
 	}
 }

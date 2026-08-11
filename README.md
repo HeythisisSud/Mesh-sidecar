@@ -1,39 +1,119 @@
 # mesh-sidecar
 
-A service mesh sidecar built from scratch in Go, for learning purposes. Implements three layers of a real service mesh — gossip-based membership, L7 HTTP proxying, and eBPF L4 transparent redirection — without using any existing mesh framework.
+A distributed systems learning project built from scratch in Go. Implements a service mesh sidecar (SWIM gossip + L7 proxy + eBPF L4 redirection) and a Raft consensus layer with a distributed key-value store — without using any existing mesh framework or consensus library.
 
 ---
 
-## What is a service mesh sidecar?
+## What is this?
 
-In a distributed system, services need to find and talk to each other reliably. A service mesh sidecar sits alongside each application instance and handles that networking transparently — tracking which nodes are alive, routing traffic to healthy backends, and failing over automatically when something dies. The application itself doesn't need to know any of this is happening.
+This project builds two things that production distributed systems like Consul, etcd, and Kubernetes rely on:
 
-This project implements the core of that idea from first principles, across three phases.
+1. **A service mesh sidecar** — tracks which nodes are alive, routes traffic to healthy backends transparently, and intercepts TCP connections at the kernel level via eBPF.
+
+2. **A Raft consensus layer** — lets a cluster of nodes agree on a sequence of operations (a distributed log) even when some nodes fail, and uses that log to drive a consistent key-value store across all nodes.
+
+Both are built from scratch: the gossip protocol implements the SWIM paper directly, the proxy uses Go's standard library, the eBPF program is written in C and compiled via clang, and the Raft implementation follows the Raft paper's Figure 2 specification.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│             Application                 │
-│         (fake HTTP backend)             │
-├─────────────────────────────────────────┤
-│          L7 Proxy (Phase 2)             │
-│   httputil.ReverseProxy + Snapshot()    │
-│   routes HTTP traffic to alive nodes    │
-├─────────────────────────────────────────┤
-│      SWIM Gossip Membership (Phase 1)   │
-│   UDP ping/ack, suspect/confirm,        │
-│   piggybacked updates, indirect ping    │
-├─────────────────────────────────────────┤
-│     eBPF L4 Redirect (Phase 3)          │
-│   cgroup/connect4 hook, BPF map,        │
-│   transparent TCP redirection           │
-└─────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                        Application Layer                         │
+│              (distributed key-value store via Raft)              │
+├──────────────────────────┬──────────────────────────────────────┤
+│   Raft Consensus         │   Service Mesh Sidecar               │
+│                          │                                       │
+│   Leader Election        │   L7 HTTP Proxy                      │
+│   Log Replication        │   (httputil.ReverseProxy)            │
+│   KV State Machine       │                                       │
+│                          ├───────────────────────────────────────┤
+│   gRPC transport         │   SWIM Gossip Membership             │
+│   (RequestVote,          │   (ping/ack, suspect/confirm,        │
+│    AppendEntries)        │    indirect ping, piggybacked         │
+│                          │    updates, JOIN handler)             │
+│                          ├───────────────────────────────────────┤
+│                          │   eBPF L4 Redirect                   │
+│                          │   (cgroup/connect4, BPF map,         │
+│                          │    transparent TCP interception)      │
+└──────────────────────────┴───────────────────────────────────────┘
 ```
 
-Each node runs all three layers simultaneously in a single binary. Ports per node (example with bind port 8000):
+---
+
+## Why SWIM and Raft together?
+
+They solve completely different problems and are deliberately kept separate:
+
+**SWIM** answers *"who is in the cluster right now?"* — it is a membership protocol. It is eventually consistent by design: different nodes can temporarily disagree about who is alive, and that is acceptable. It scales well because each node only talks to a small number of peers per round, regardless of cluster size.
+
+**Raft** answers *"what is the agreed-upon state of our data?"* — it is a consensus protocol. It requires strong consistency: every node must apply the same log entries in the same order, with no disagreement ever. It assumes it already knows who the members are.
+
+The dependency is one-directional: Raft needs to know its peer set (which SWIM can provide dynamically), but SWIM does not need Raft. In production systems like HashiCorp's Consul, Serf (SWIM-based) handles membership and feeds peer changes into Raft's configuration. This project builds both layers from scratch.
+
+---
+
+## Project structure
+
+```
+mesh-sidecar/
+├── main.go              # mesh sidecar entry point
+├── members/
+│   └── choosing.go      # SWIM gossip: Node, MemberState, ping/ack/suspect/confirm/JOIN
+├── proxy/
+│   └── proxy.go         # L7 HTTP reverse proxy with live membership routing
+├── ebpf/
+│   ├── redirect.c        # eBPF C program: cgroup/connect4 hook + BPF hash map
+│   ├── ebpf.go           # bpf2go generate directive
+│   ├── redirect.go       # Go loader: attach program, read/write BPF map
+│   ├── redirect_bpfel.go # generated by bpf2go (little-endian)
+│   └── redirect_bpfeb.go # generated by bpf2go (big-endian)
+└── raft/
+    ├── raft.go           # Raft state machine: election, log replication, commit
+    ├── server.go         # gRPC server: RequestVote and AppendEntries handlers
+    ├── client.go         # gRPC client: callRequestVote, callAppendEntries, sendHeartbeats
+    ├── kv.go             # Key-value state machine driven by the Raft log
+    └── proto/
+        ├── raft.proto         # protobuf service definition
+        ├── raft.pb.go         # generated message types
+        └── raft_grpc.pb.go    # generated gRPC stubs
+```
+
+---
+
+## Part 1: Service Mesh Sidecar
+
+### Phase 1 — SWIM gossip membership
+
+Every node maintains a membership table tracking peers as `Alive`, `Suspect`, or `Confirm` (dead). Nodes exchange this via UDP using the SWIM protocol:
+
+- Every second, each node picks one random peer and sends a `PING`
+- If no `ACK` arrives within 500ms, the node asks up to 3 other peers to relay an indirect ping (`PING-REQ`) — this distinguishes a dead node from a network partition between two specific nodes
+- If indirect ping also fails after another 500ms, the target is marked `Suspect`
+- After 3 seconds in Suspect state with no refutation, the node is marked `Confirm` and removed from the membership table
+- Every message carries piggybacked `Update` entries gossipping state changes across the cluster without any broadcast
+- A node that is incorrectly suspected refutes it by broadcasting a higher-incarnation `Alive` update about itself
+
+### Phase 2 — L7 HTTP proxy
+
+Each node runs an HTTP reverse proxy alongside its app backend. On every incoming request, the proxy calls `node.Snapshot()` to get the current live membership, picks the next alive node in sorted round-robin order, and forwards the request there. Because it reads from the same membership table gossip maintains, it automatically stops routing to a dead node within one sync cycle.
+
+### Phase 3 — eBPF L4 transparent redirection
+
+A `cgroup/connect4` BPF program is compiled via clang and loaded into the kernel, attached to the cgroup that WSL2 processes run in. This program intercepts every outgoing TCP `connect()` syscall before the connection is established. If the destination port matches an entry in a BPF hash map, the kernel silently rewrites the destination — the client never knows the switch happened.
+
+A goroutine syncs the live membership table into the BPF map every second:
+
+```
+A:9000 → B:9001
+B:9001 → C:9002
+C:9002 → A:9000
+```
+
+When a node dies and gossip confirms it, its BPF map entry is removed and the rotation updates automatically. Unlike the L7 proxy (which requires clients to deliberately connect to a proxy port), eBPF interception is completely transparent — any application connecting to any of these ports gets redirected without knowing a mesh exists.
+
+### Ports per node (example with gossip port 8000)
 
 | Layer | Port |
 |---|---|
@@ -42,163 +122,157 @@ Each node runs all three layers simultaneously in a single binary. Ports per nod
 | L7 proxy | 10000 |
 | Status API | 11000 |
 
----
-
-## How each phase works
-
-### Phase 1 — SWIM gossip membership
-
-Every node maintains a membership table of who it knows about and whether they are `Alive`, `Suspect`, or `Confirm` (dead). Nodes exchange this information via UDP using the SWIM protocol:
-
-- Every second, each node picks one random peer and sends it a `PING`
-- If no `ACK` arrives within 500ms, the node asks up to 3 other peers to relay an indirect ping (`PING-REQ`) — this distinguishes a dead node from a network partition between two specific nodes
-- If indirect ping also fails after another 500ms, the target is marked `Suspect`
-- After 3 seconds in Suspect state with no refutation, the node is marked `Confirm` and removed from the membership table
-- Every message carries piggybacked `Update` entries, gossipping state changes across the cluster without any broadcast
-
-A node that is incorrectly suspected can refute it by broadcasting a higher-incarnation `Alive` update about itself.
-
-### Phase 2 — L7 HTTP proxy
-
-Each node runs an HTTP reverse proxy (`httputil.ReverseProxy`) alongside its app backend. Instead of routing to a hardcoded address, the proxy calls `node.Snapshot()` on every incoming request to get the current live membership, picks the next alive node in sorted round-robin order, and forwards the request there.
-
-Because the proxy reads from the same membership table that gossip maintains, it automatically stops sending traffic to a node within one sync cycle of that node being marked dead — no manual intervention, no config reload.
-
-### Phase 3 — eBPF L4 transparent redirection
-
-The L7 proxy requires the client to deliberately connect to the proxy port. eBPF removes that requirement entirely.
-
-A `cgroup/connect4` BPF program is compiled (via clang) and loaded into the kernel, attached to the cgroup that WSL2 processes live in. This program intercepts every outgoing TCP `connect()` syscall before the connection is established. If the destination port matches an entry in a BPF hash map, the kernel silently rewrites the destination IP and port — the client never knows the switch happened.
-
-A goroutine in the owning node (node A) syncs the live membership table into the BPF map every second, maintaining the rotation:
-
-```
-A:9000 → B:9001
-B:9001 → C:9002
-C:9002 → A:9000
-```
-
-When a node dies and is confirmed by gossip, its BPF map entry is removed and the rotation updates automatically.
-
----
-
-## Requirements
+### Requirements
 
 - Linux kernel >= 5.15 with `CONFIG_CGROUP_BPF=y` and `CONFIG_DEBUG_INFO_BTF=y`
-- WSL2 (Ubuntu 22.04 or 24.04) or native Linux
+- WSL2 (Ubuntu 22.04+) or native Linux
 - Go 1.21+
-- `clang`, `llvm`, `libbpf-dev` (for eBPF compilation)
+- `clang`, `llvm`, `libbpf-dev`
 
 ```bash
 sudo apt install -y clang llvm libbpf-dev linux-headers-generic build-essential
 go install github.com/cilium/ebpf/cmd/bpf2go@latest
 ```
 
----
-
-## Building
+### Building the sidecar
 
 ```bash
-# compile the eBPF C program into Go-embeddable bytecode
-cd ebpf
-go generate
-cd ..
+# compile the eBPF C program
+cd ebpf && go generate && cd ..
 
-# build the binary
+# build the sidecar binary
 go build -o mesh-sidecar ./...
 ```
 
----
-
-## Running
+### Running the sidecar
 
 ```bash
-# mount bpffs once per boot (needed for shared BPF map)
+# mount bpffs once per boot
 sudo mount -t bpf bpf /sys/fs/bpf
 
 # node A -- owns the eBPF program and BPF map
 sudo ./mesh-sidecar -id=A -bind=127.0.0.1:8000 -ebpf
 
-# node B -- joins through A, gossip only
+# node B and C -- gossip only, no eBPF flag needed
 sudo ./mesh-sidecar -id=B -bind=127.0.0.1:8001 -join=127.0.0.1:8000
-
-# node C -- joins through A, gossip only
 sudo ./mesh-sidecar -id=C -bind=127.0.0.1:8002 -join=127.0.0.1:8000
 ```
 
-**REPL commands** (in any node terminal):
-
-```
-members   -- print current membership view
-quit      -- graceful shutdown
-```
-
-**Test L4 redirection** (after all three nodes have joined):
+### Testing
 
 ```bash
-# these should return responses from DIFFERENT nodes than the port implies
+# test L4 transparent redirection -- should return different nodes than the port implies
 curl http://127.0.0.1:9000/   # → hello from B
 curl http://127.0.0.1:9001/   # → hello from C
 curl http://127.0.0.1:9002/   # → hello from A
-```
 
-**Test failure detection**:
+# test failure detection -- kill node B, wait ~5 seconds
+curl http://127.0.0.1:9001/   # → connection refused (removed from BPF map)
 
-```bash
-# kill node B (Ctrl+C in its terminal)
-# wait ~5 seconds for suspect → confirm cascade
-curl http://127.0.0.1:9001/   # → connection refused (B removed from map)
-```
-
-**Status API**:
-
-```bash
+# view live membership as JSON
 curl http://127.0.0.1:11000/status | jq
 ```
 
 ---
 
-## Project structure
+## Part 2: Raft Consensus + Distributed KV Store
+
+### How Raft works
+
+Raft solves the problem of getting a cluster of nodes to agree on a sequence of operations even when some nodes fail. Every write goes through a single elected leader, which replicates the operation to a majority of nodes before considering it committed. Even if the leader dies, the cluster elects a new one that is guaranteed to have all previously committed entries.
+
+**Three subproblems:**
+
+**Leader election** — nodes start as followers. When a follower stops hearing from a leader (election timeout, randomized between 150-300ms to prevent split votes), it becomes a candidate and requests votes. A candidate wins if it gets votes from a majority of nodes. Voters only grant votes to candidates whose logs are at least as up-to-date as their own.
+
+**Log replication** — the leader appends each submitted command to its log, then sends `AppendEntries` RPCs to all followers in parallel. Once a majority confirm, the entry is committed and applied to the state machine. The leader sends heartbeats (empty `AppendEntries`) every 50ms to suppress new elections.
+
+**Safety** — a node can only become leader if it has all previously committed log entries. This is enforced by the vote-granting rule: a follower rejects a `RequestVote` if the candidate's log is less up-to-date than its own.
+
+### Key-value state machine
+
+The KV store sits on top of Raft's `ApplyCh` — a channel that receives committed log entries in order. Each entry is a command string (`SET key value` or `DEL key`). The state machine applies these commands to an in-memory `map[string]string`. Because every node applies the same entries from the same log in the same order, all nodes converge to identical state.
+
+Reads are served locally (may be slightly stale on followers). Writes are submitted to the leader and block until committed by a majority.
+
+### Requirements
+
+- Go 1.21+
+- `protoc` compiler and Go gRPC plugins
+
+```bash
+sudo apt install -y protobuf-compiler
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+```
+
+### Building the Raft layer
+
+```bash
+# generate gRPC stubs from proto
+cd raft/proto
+protoc \
+  --go_out=. --go_opt=paths=source_relative \
+  --go-grpc_out=. --go-grpc_opt=paths=source_relative \
+  raft.proto
+cd ../..
+
+go build ./raft/...
+```
+
+### Running the Raft demo
+
+```bash
+go run ./cmd/raft/main.go
+```
+
+Expected output:
 
 ```
-mesh-sidecar/
-├── main.go              # wires all three phases together
-├── members/
-│   └── choosing.go      # SWIM gossip: Node, MemberState, ping/ack/suspect/confirm
-├── proxy/
-│   └── proxy.go         # L7 HTTP reverse proxy with live membership routing
-└── ebpf/
-    ├── redirect.c        # eBPF C program: cgroup/connect4 hook + BPF map
-    ├── ebpf.go           # bpf2go generate directive
-    ├── redirect.go       # Go loader: attach program, read/write BPF map
-    ├── redirect_bpfel.go # generated by bpf2go (little-endian)
-    └── redirect_bpfeb.go # generated by bpf2go (big-endian)
+[B] starting election for term 1
+[A] granted vote to B for term 1
+[C] granted vote to B for term 1
+[B] became leader for term 1
+>>> leader is B, submitting KV ops
+[A] state: map[x:2 y:hello]
+[B] state: map[x:2 y:hello]
+[C] state: map[x:2 y:hello]
+after DEL y:
+[A] state: map[x:2]
+[B] state: map[x:2]
+[C] state: map[x:2]
+>>> killing leader B...
+[C] starting election for term 2
+[C] became leader for term 2
 ```
+
+All three nodes converge to identical state. After the leader is killed, a new one is elected in the next term and the cluster continues without data loss.
 
 ---
 
 ## Known simplifications
 
-This is a learning project. Several things are deliberately simplified compared to a production service mesh:
+**Mesh sidecar:**
+- Fixed port offset convention (app = gossip+1000, proxy = gossip+2000) instead of gossiping the real service address
+- Single BPF program owner per machine — in a real deployment each physical machine runs one sidecar independently
+- No TLS on gossip or proxy traffic
+- Manual seed address via `-join` instead of DNS-based discovery
+- In-memory membership state only
 
-**Fixed port offset convention** — app port = gossip port + 1000, proxy port = gossip port + 2000. A real system would gossip the actual service address so nodes aren't coupled to a port numbering scheme.
-
-**Single BPF program owner** — only one node (whichever starts first with `-ebpf`) attaches the kernel program. In a real deployment each physical machine runs one sidecar that owns its own cgroup attachment independently.
-
-**No TLS** — all gossip and proxy traffic is plaintext. Production meshes use mTLS for both encryption and identity verification between nodes.
-
-**Manual seed address** — a joining node needs to be given one existing member's address via `-join`. Real systems use DNS SRV records, cloud provider metadata APIs, or a dedicated discovery service to bootstrap this.
-
-**No service registry** — there is one implicit "service" (the fake HTTP backend on each node). A real mesh would separate the concepts of "node" and "service instance," supporting multiple services per node and routing by service name rather than by port.
-
-**In-memory state only** — membership state is lost on restart. A real system would persist enough state to rejoin the cluster gracefully after a crash.
+**Raft:**
+- No persistence — `currentTerm`, `votedFor`, and `log[]` are lost on crash
+- No log catchup for lagging nodes — if a follower misses entries while down, the leader does not retry with earlier log indices
+- Local reads — `Get()` reads from local state and may be stale on followers
+- No cluster membership changes — the peer set is static, defined at startup
 
 ---
 
 ## References
 
-- [SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol](https://ieeexplore.ieee.org/document/1028914) — Das, Gupta, Motivala (2002). The paper this gossip implementation is based on.
-- [hashicorp/memberlist](https://github.com/hashicorp/memberlist) — production Go implementation of SWIM, used in Consul and Serf. Useful to compare against after reading the paper.
-- [cilium/ebpf](https://github.com/cilium/ebpf) — the Go library used for loading and managing eBPF programs.
-- [ebpf-go getting started guide](https://ebpf-go.dev/guides/getting-started/) — walkthrough of the bpf2go toolchain used in Phase 3.
-- [Envoy Proxy](https://www.envoyproxy.io/) and [Linkerd](https://linkerd.io/) — production service mesh data planes that implement the same ideas at scale.
+- [SWIM: Scalable Weakly-consistent Infection-style Process Group Membership Protocol](https://ieeexplore.ieee.org/document/1028914) — Das, Gupta, Motivala (2002)
+- [In Search of an Understandable Consensus Algorithm (Raft)](https://raft.github.io/raft.pdf) — Ongaro and Ousterhout (2014)
+- [hashicorp/memberlist](https://github.com/hashicorp/memberlist) — production SWIM implementation used in Consul
+- [hashicorp/raft](https://github.com/hashicorp/raft) — production Raft implementation used in Consul
+- [cilium/ebpf](https://github.com/cilium/ebpf) — Go library for loading and managing eBPF programs
+- [ebpf-go getting started](https://ebpf-go.dev/guides/getting-started/) — bpf2go toolchain walkthrough
+- [Envoy Proxy](https://www.envoyproxy.io/) and [Linkerd](https://linkerd.io/) — production service mesh data planes
