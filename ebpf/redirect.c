@@ -19,13 +19,10 @@ struct {
 
 SEC("cgroup/connect4")
 int redirect_connect(struct bpf_sock_addr *ctx) {
-    // user_port holds htons(port) in the LOWER 16 bits on this kernel.
-    // bpf_ntohs converts it back to host-byte-order port number.
-    // No >> 16 shift -- that was wrong and threw away the real value.
+
     __u32 port = bpf_ntohs((__u16)ctx->user_port);
 
-    // Only intercept loopback -- user_ip4 is little-endian on x86,
-    // so 127.0.0.1 = [0x7f,0x00,0x00,0x01] read as LE = 0x0100007f
+  
     if (ctx->user_ip4 != 0x0100007f) {
         return 1;
     }

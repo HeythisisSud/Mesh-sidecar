@@ -13,11 +13,7 @@ import (
 	"github.com/HeythisisSud/mesh-sidecar/members" // TODO: adjust to your actual module path
 )
 
-// TestNewProxy_SpreadsAcrossAliveBackends spins up several fake
-// backends, registers them as "Alive" members on a real Node, then
-// fires many requests through the proxy and checks that more than
-// one distinct backend answered -- proving selection isn't hardcoded
-// to a single target.
+
 func TestNewProxy_SpreadsAcrossAliveBackends(t *testing.T) {
 	const numBackends = 3
 	const numRequests = 30

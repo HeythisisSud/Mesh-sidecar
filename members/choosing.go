@@ -16,15 +16,14 @@ type Node struct {
 	Members  map[string]*MemberState
 	mu       sync.RWMutex
 	conn     *net.UDPConn
-
 	pendingPings map[uint64]chan struct{}
 	pendingMu    sync.Mutex
 	counter      uint64
 	pendingJoin map[uint64]chan struct{}
 	pendingJoinMu  sync.Mutex
-	gossipQueue    []string // shuffled member IDs, walked in order
+	gossipQueue    []string 
 	queuePos       int
-	relayRequests  map[uint64]*net.UDPAddr // seq -> original requester
+	relayRequests  map[uint64]*net.UDPAddr 
 	relayMu        sync.Mutex
 	pendingUpdates []Update
 	updatesMu      sync.Mutex
@@ -40,8 +39,8 @@ type Update struct {
 type MemberState struct {
 	ID          string
 	Addr        *net.UDPAddr
-	Status      string // StatusAlive, StatusSuspect, "dead"
-	Incarnation int    // version number, bumps on state change
+	Status      string
+	Incarnation int  
 	LastSeen    time.Time
 }
 
@@ -99,8 +98,7 @@ func (n *Node) SnapShot() []MemberState{
 	return list
 
 }
-// gossipLoop ticks once a second and pings ONE random member.
-// This is the actual gossip round -- not a broadcast to everyone.
+
 
 func (n *Node) gossipLoop() {
 	ticker := time.NewTicker(1 * time.Second)
@@ -128,13 +126,12 @@ func (n *Node) pickNextMember() *MemberState {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// rebuild the queue if it's empty, stale, or we've reached the end
 	if n.queuePos >= len(n.gossipQueue) {
 		n.rebuildQueue()
 		n.queuePos = 0
 	}
 	if len(n.gossipQueue) == 0 {
-		return nil // still no one to ping
+		return nil
 	}
 
 	id := n.gossipQueue[n.queuePos]
@@ -399,7 +396,6 @@ func (n *Node) handlePingReq(msg Message, requesterAddr *net.UDPAddr) {
 		return
 	}
 
-	// I am the relay -- I ping the TARGET, not the requester
 	if _, err := n.conn.WriteToUDP(mess, targetAddr); err != nil {
 		log.Println("send ping failed:", err)
 		return
@@ -409,7 +405,7 @@ func (n *Node) handlePing(msg Message, addr *net.UDPAddr) {
 	reply := Message{
 		MessageType: "ACK",
 		From:        n.BindAddr.String(),
-		Counter:     msg.Counter, // same seq number the ping carried
+		Counter:     msg.Counter, 
 	}
 	mess, err := json.Marshal(reply)
 	if err != nil {
@@ -417,8 +413,7 @@ func (n *Node) handlePing(msg Message, addr *net.UDPAddr) {
 		return
 	}
 
-	// reply to whoever just sent us the packet -- NOT to any
-	// address embedded in the message
+
 	if _, err := n.conn.WriteToUDP(mess, addr); err != nil {
 		log.Println("send ack failed:", err)
 		return
@@ -491,8 +486,7 @@ func (n *Node) Join(peerAddr *net.UDPAddr) error {
 		return nil
 	case<-time.After(3 * time.Second):
 		return errors.New("timeout")
-		//logic to change the master node 
-		//MASTER node is something whom we send a join request to
+	
 
 
 	}

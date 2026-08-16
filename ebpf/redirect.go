@@ -51,16 +51,13 @@ func (r *Redirector) SetTarget(origPort uint16, destIP net.IP, destPort uint16) 
 		return fmt.Errorf("only IPv4 supported")
 	}
 
-	// key: plain host-byte-order port, matches bpf_ntohs((__u16)ctx->user_port)
 	key := uint32(origPort)
 
 	target := RedirectRedirectTarget{
-		// user_ip4 is little-endian on x86:
-		// 127.0.0.1 = [0x7f,0x00,0x00,0x01] -> LittleEndian.Uint32 -> 0x0100007f
+		
 		Ip: binary.LittleEndian.Uint32(ip4),
 
-		// user_port: htons(destPort) in lower 16 bits, no shift.
-		// htons(9001) = 0x2923, stored as 0x00002923
+	
 		Port: uint32(htons(destPort)),
 	}
 
@@ -101,7 +98,6 @@ func isCgroupV2Root(path string) bool {
 	return st.Type == cgroup2SuperMagic
 }
 
-// htons converts a uint16 from host to network byte order.
 func htons(v uint16) uint16 {
 	b := [2]byte{}
 	binary.BigEndian.PutUint16(b[:], v)
