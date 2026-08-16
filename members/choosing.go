@@ -16,17 +16,23 @@ type Node struct {
 	Members  map[string]*MemberState
 	mu       sync.RWMutex
 	conn     *net.UDPConn
+
 	pendingPings map[uint64]chan struct{}
 	pendingMu    sync.Mutex
 	counter      uint64
-	pendingJoin map[uint64]chan struct{}
-	pendingJoinMu  sync.Mutex
-	gossipQueue    []string 
-	queuePos       int
-	relayRequests  map[uint64]*net.UDPAddr 
-	relayMu        sync.Mutex
+
+	pendingJoin   map[uint64]chan struct{}
+	pendingJoinMu sync.Mutex
+
+	gossipQueue []string
+	queuePos    int
+
+	relayRequests map[uint64]*net.UDPAddr
+	relayMu       sync.Mutex
+
 	pendingUpdates []Update
 	updatesMu      sync.Mutex
+
 	Incarnation int
 }
 
@@ -40,21 +46,20 @@ type MemberState struct {
 	ID          string
 	Addr        *net.UDPAddr
 	Status      string
-	Incarnation int  
+	Incarnation int
 	LastSeen    time.Time
 }
 
 const (
-    StatusAlive   = "Alive"
-    StatusSuspect = "Suspect"
-    StatusConfirm = "Confirm"
+	StatusAlive   = "Alive"
+	StatusSuspect = "Suspect"
+	StatusConfirm = "Confirm"
 )
 
 type Message struct {
-	MessageType    string // "PING", "ACK", etc.
-	From           string // sender's own address, as a string
-	Counter        uint64 // matches a PING to its ACK
-	 	 
+	MessageType    string
+	From           string
+	Counter        uint64
 	IndirectTarget string
 	Updates        []Update
 	Members        []MemberInfo
@@ -76,8 +81,8 @@ func NewNode(id string, bindAddr *net.UDPAddr, conn *net.UDPConn) *Node {
 		conn:          conn,
 		pendingPings:  make(map[uint64]chan struct{}),
 		relayRequests: make(map[uint64]*net.UDPAddr),
-		Incarnation: 0,
-		pendingJoin: make(map[uint64]chan struct{}),
+		pendingJoin:   make(map[uint64]chan struct{}),
+		Incarnation:   0,
 	}
 }
 
@@ -86,24 +91,20 @@ func (n *Node) Start() {
 	go n.gossipLoop()
 }
 
-
-func (n *Node) SnapShot() []MemberState{
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	var list []MemberState
-	for _, value:= range n.Members{
-		list = append(list, *value)
+// SnapShot returns a point-in-time copy of membership. Uses RLock because it is read-only.
+func (n *Node) SnapShot() []MemberState {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	list := make([]MemberState, 0, len(n.Members))
+	for _, v := range n.Members {
+		list = append(list, *v)
 	}
-
 	return list
-
 }
-
 
 func (n *Node) gossipLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-
 	for range ticker.C {
 		target := n.pickNextMember()
 		if target == nil {
@@ -113,12 +114,17 @@ func (n *Node) gossipLoop() {
 	}
 }
 
+// drainUpdates removes and returns a copy of all pending updates.
+// The returned slice is independent of pendingUpdates.
 func (n *Node) drainUpdates() []Update {
 	n.updatesMu.Lock()
 	defer n.updatesMu.Unlock()
-
-	out := n.pendingUpdates[:]
-
+	if len(n.pendingUpdates) == 0 {
+		return nil
+	}
+	out := make([]Update, len(n.pendingUpdates))
+	copy(out, n.pendingUpdates)
+	n.pendingUpdates = n.pendingUpdates[:0]
 	return out
 }
 
@@ -133,17 +139,18 @@ func (n *Node) pickNextMember() *MemberState {
 	if len(n.gossipQueue) == 0 {
 		return nil
 	}
-
 	id := n.gossipQueue[n.queuePos]
 	n.queuePos++
-	return n.Members[id]
+	m, ok := n.Members[id]
+	if !ok {
+		return nil
+	}
+	return m
 }
 
-// rebuildQueue snapshots current members (excluding self) and shuffles them.
-// Called with n.mu already held.
+// rebuildQueue MUST be called with n.mu held.
+// Lock ordering: n.mu -> updatesMu (consistent everywhere).
 func (n *Node) rebuildQueue() {
-	n.updatesMu.Lock()
-	defer n.updatesMu.Unlock()
 	ids := make([]string, 0, len(n.Members))
 	for id := range n.Members {
 		if id == n.ID {
@@ -151,24 +158,25 @@ func (n *Node) rebuildQueue() {
 		}
 		ids = append(ids, id)
 	}
-	rand.Shuffle(len(ids), func(i, j int) {
-		ids[i], ids[j] = ids[j], ids[i]
-	})
+	rand.Shuffle(len(ids), func(i, j int) { ids[i], ids[j] = ids[j], ids[i] })
 	n.gossipQueue = ids
-	clear(n.pendingUpdates)
+
+	n.updatesMu.Lock()
+	n.pendingUpdates = n.pendingUpdates[:0]
+	n.updatesMu.Unlock()
 }
 
-
-
-func (n *Node) buildUpdates(status string, memberId string, incarnation int) {
+// buildUpdates MUST NOT be called while updatesMu is already held.
+func (n *Node) buildUpdates(status, memberID string, incarnation int) {
 	n.updatesMu.Lock()
 	defer n.updatesMu.Unlock()
 	n.pendingUpdates = append(n.pendingUpdates, Update{
-		MemberID:    memberId,
+		MemberID:    memberID,
 		Status:      status,
 		Incarnation: incarnation,
 	})
 }
+
 func (n *Node) pingMember(target *MemberState) {
 	seq := n.nextCounter()
 
@@ -194,7 +202,6 @@ func (n *Node) pingMember(target *MemberState) {
 		log.Println("marshal ping failed:", err)
 		return
 	}
-
 	if _, err := n.conn.WriteToUDP(mess, target.Addr); err != nil {
 		log.Println("send ping failed:", err)
 		return
@@ -203,45 +210,50 @@ func (n *Node) pingMember(target *MemberState) {
 	select {
 	case <-waitCh:
 		n.mu.Lock()
-		target.Status = StatusAlive
-		target.LastSeen = time.Now()
+		if m, ok := n.Members[target.ID]; ok {
+			m.Status = StatusAlive
+			m.LastSeen = time.Now()
+		}
 		n.mu.Unlock()
 
 	case <-time.After(500 * time.Millisecond):
-
 		n.indirectPing(target, seq)
 
 		select {
 		case <-waitCh:
 			n.mu.Lock()
-			target.Status = StatusAlive
-			target.LastSeen = time.Now()
-
+			if m, ok := n.Members[target.ID]; ok {
+				m.Status = StatusAlive
+				m.LastSeen = time.Now()
+			}
 			n.mu.Unlock()
 
 		case <-time.After(500 * time.Millisecond):
 			n.mu.Lock()
-			target.Status = StatusSuspect
-			n.buildUpdates(target.Status, target.ID, target.Incarnation)
-
+			if m, ok := n.Members[target.ID]; ok {
+				m.Status = StatusSuspect
+				n.buildUpdates(StatusSuspect, m.ID, m.Incarnation)
+			}
 			n.mu.Unlock()
-			log.Printf("indirect ping also failed, marking %s suspect (seq %d)\n", target.Addr, seq)
 
 			select {
 			case <-waitCh:
 				n.mu.Lock()
-				target.Status = StatusAlive
-				target.LastSeen = time.Now()
-				n.buildUpdates(target.Status, target.ID, target.Incarnation)
+				if m, ok := n.Members[target.ID]; ok {
+					m.Status = StatusAlive
+					m.LastSeen = time.Now()
+					n.buildUpdates(StatusAlive, m.ID, m.Incarnation)
+				}
 				n.mu.Unlock()
 
 			case <-time.After(3 * time.Second):
 				n.mu.Lock()
-				target.Status = StatusConfirm
-				n.buildUpdates(target.Status, target.ID, target.Incarnation)
+				if m, ok := n.Members[target.ID]; ok {
+					n.buildUpdates(StatusConfirm, m.ID, m.Incarnation)
+					delete(n.Members, m.ID)
+				}
 				n.mu.Unlock()
-				log.Printf("indirect ping also failed, marking %s suspect (seq %d)\n", target.Addr, seq)
-
+				log.Printf("node %s confirmed dead (seq %d)\n", target.Addr, seq)
 			}
 		}
 	}
@@ -252,29 +264,26 @@ func (n *Node) indirectPing(target *MemberState, seq uint64) {
 	if len(relays) == 0 {
 		return
 	}
-
+	updates := n.drainUpdates()
 	for _, relay := range relays {
 		msg := Message{
 			MessageType:    "PING-REQ",
 			From:           n.BindAddr.String(),
 			Counter:        seq,
 			IndirectTarget: target.Addr.String(),
-			Updates:        n.drainUpdates(),
+			Updates:        updates,
 		}
 		mess, err := json.Marshal(msg)
 		if err != nil {
 			continue
 		}
-		
 		go n.conn.WriteToUDP(mess, relay.Addr)
 	}
 }
 
-
 func (n *Node) pickRelays(target *MemberState, count int) []*MemberState {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-
 	candidates := make([]*MemberState, 0, len(n.Members))
 	for id, m := range n.Members {
 		if id == n.ID || m.Addr.String() == target.Addr.String() {
@@ -282,9 +291,7 @@ func (n *Node) pickRelays(target *MemberState, count int) []*MemberState {
 		}
 		candidates = append(candidates, m)
 	}
-	rand.Shuffle(len(candidates), func(i, j int) {
-		candidates[i], candidates[j] = candidates[j], candidates[i]
-	})
+	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
 	if len(candidates) > count {
 		candidates = candidates[:count]
 	}
@@ -299,12 +306,12 @@ func (n *Node) nextCounter() uint64 {
 }
 
 func (n *Node) receiveLoop() {
-	buf := make([]byte, 65535) // max theoretical UDP payload size
+	buf := make([]byte, 65535)
 	for {
 		b, senderAddr, err := n.conn.ReadFromUDP(buf)
 		if err != nil {
 			log.Println("read failed:", err)
-			continue
+			return
 		}
 		n.handleMessage(buf[:b], senderAddr)
 	}
@@ -317,7 +324,6 @@ func (n *Node) handleMessage(buf []byte, addr *net.UDPAddr) {
 		return
 	}
 	n.mergeUpdates(msg.Updates)
-
 	switch msg.MessageType {
 	case "PING":
 		n.handlePing(msg, addr)
@@ -332,34 +338,37 @@ func (n *Node) handleMessage(buf []byte, addr *net.UDPAddr) {
 	}
 }
 
+// mergeUpdates applies piggybacked updates. Lock ordering: n.mu -> updatesMu.
 func (n *Node) mergeUpdates(updates []Update) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	for _, u := range updates {
+		// Self-refutation: bump incarnation and re-assert Alive.
 		if u.MemberID == n.ID && (u.Status == StatusSuspect || u.Status == StatusConfirm) {
-			n.Incarnation=u.Incarnation+1
+			n.Incarnation = u.Incarnation + 1
 			n.buildUpdates(StatusAlive, n.ID, n.Incarnation)
-			
+			continue
 		}
+
 		existing, known := n.Members[u.MemberID]
 		if !known {
 			continue
 		}
+
+		// Confirm: delete and continue — never touch the deleted struct.
 		if u.Status == StatusConfirm {
 			delete(n.Members, u.MemberID)
 			continue
-
 		}
 
 		if u.Status == StatusSuspect && u.Incarnation >= existing.Incarnation {
 			existing.Status = u.Status
 			existing.Incarnation = u.Incarnation
 			continue
-
 		}
 
-		if u.Incarnation < existing.Incarnation && u.Status != StatusConfirm {
+		if u.Incarnation < existing.Incarnation {
 			continue
 		}
 		if u.Incarnation == existing.Incarnation && u.Status == existing.Status {
@@ -377,8 +386,6 @@ func (n *Node) handlePingReq(msg Message, requesterAddr *net.UDPAddr) {
 		log.Println("bad target address:", err)
 		return
 	}
-
-	
 	n.relayMu.Lock()
 	n.relayRequests[msg.Counter] = requesterAddr
 	n.relayMu.Unlock()
@@ -386,42 +393,30 @@ func (n *Node) handlePingReq(msg Message, requesterAddr *net.UDPAddr) {
 	reply := Message{
 		MessageType: "PING",
 		From:        n.BindAddr.String(),
-		Counter:     msg.Counter, 
+		Counter:     msg.Counter,
 		Updates:     n.drainUpdates(),
 	}
-
 	mess, err := json.Marshal(reply)
 	if err != nil {
-		log.Println("marshal ping failed:", err)
 		return
 	}
-
-	if _, err := n.conn.WriteToUDP(mess, targetAddr); err != nil {
-		log.Println("send ping failed:", err)
-		return
-	}
+	n.conn.WriteToUDP(mess, targetAddr)
 }
+
 func (n *Node) handlePing(msg Message, addr *net.UDPAddr) {
 	reply := Message{
 		MessageType: "ACK",
 		From:        n.BindAddr.String(),
-		Counter:     msg.Counter, 
+		Counter:     msg.Counter,
 	}
 	mess, err := json.Marshal(reply)
 	if err != nil {
-		log.Println("marshal ack failed:", err)
 		return
 	}
-
-
-	if _, err := n.conn.WriteToUDP(mess, addr); err != nil {
-		log.Println("send ack failed:", err)
-		return
-	}
+	n.conn.WriteToUDP(mess, addr)
 }
 
 func (n *Node) handleAck(msg Message, addr *net.UDPAddr) {
-	// case 1: this is a relay job -- forward the ack to whoever asked us
 	n.relayMu.Lock()
 	requesterAddr, isRelay := n.relayRequests[msg.Counter]
 	if isRelay {
@@ -430,26 +425,26 @@ func (n *Node) handleAck(msg Message, addr *net.UDPAddr) {
 	n.relayMu.Unlock()
 
 	if isRelay {
-		mess, err := json.Marshal(msg) // forward as-is, same seq
-		if err != nil {
-			return
-		}
+		mess, _ := json.Marshal(msg)
 		n.conn.WriteToUDP(mess, requesterAddr)
 		return
 	}
 
-	// case 2: this is our own ping -- existing logic
 	n.pendingMu.Lock()
 	waitCh, ok := n.pendingPings[msg.Counter]
 	n.pendingMu.Unlock()
 	if !ok {
 		return
 	}
-	close(waitCh)
+	// Guard against double-close (relay + direct ACK for same seq).
+	select {
+	case <-waitCh:
+	default:
+		close(waitCh)
+	}
 }
 
 func (n *Node) Join(peerAddr *net.UDPAddr) error {
-
 	seq := n.nextCounter()
 
 	waitCh := make(chan struct{})
@@ -462,131 +457,113 @@ func (n *Node) Join(peerAddr *net.UDPAddr) error {
 		delete(n.pendingJoin, seq)
 		n.pendingJoinMu.Unlock()
 	}()
-	reply := Message{
+
+	msg := Message{
 		MessageType: "JOIN",
 		From:        n.BindAddr.String(),
 		JoinerID:    n.ID,
-		Counter: seq,
+		Counter:     seq,
 	}
-
-	mess, err := json.Marshal(reply)
+	mess, err := json.Marshal(msg)
 	if err != nil {
-		log.Println("marshal ack failed:", err)
 		return err
 	}
-
 	if _, err := n.conn.WriteToUDP(mess, peerAddr); err != nil {
-		log.Println("send ack failed:", err)
 		return err
 	}
-
-	select{
-
-	case<-waitCh:
+	select {
+	case <-waitCh:
 		return nil
-	case<-time.After(3 * time.Second):
-		return errors.New("timeout")
-	
-
-
+	case <-time.After(3 * time.Second):
+		return errors.New("join timeout")
 	}
-
 }
 
+// handleJoin releases n.mu before the blocking WriteToUDP call to avoid
+// holding a lock across I/O. Lock ordering for updatesMu: only updatesMu
+// is acquired at the end, n.mu is already released.
 func (n *Node) handleJoin(msg Message) {
-	JoinerAddr, err := net.ResolveUDPAddr("udp", msg.From)
+	joinerAddr, err := net.ResolveUDPAddr("udp", msg.From)
 	if err != nil {
-		log.Println("handle join failed")
+		log.Println("handleJoin: bad joiner address:", err)
 		return
 	}
 
-	state := MemberState{
-		ID:          msg.JoinerID,
-		Addr:        JoinerAddr,
-		Incarnation: 1,
-		Status: StatusAlive,
-	}
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	n.Members[msg.JoinerID] = &state
-	
-	var member MemberInfo
-	var members []MemberInfo
-	for _, value := range n.Members {
-		member = MemberInfo{
-			ID:          value.ID,
-			Status:      value.Status,
-			Incarnation: value.Incarnation,
-			Addr:        value.Addr.String(),
-		}
-
-		members = append(members, member)
-
+	n.Members[msg.JoinerID] = &MemberState{
+		ID:          msg.JoinerID,
+		Addr:        joinerAddr,
+		Incarnation: 1,
+		Status:      StatusAlive,
 	}
-	members = append(members, MemberInfo{
-    ID:          n.ID,
-    Status:      StatusAlive,
-    Incarnation: n.Incarnation, // or track your own incarnation if you have one
-    Addr:        n.BindAddr.String(),
+	memberList := make([]MemberInfo, 0, len(n.Members)+1)
+	for _, v := range n.Members {
+		memberList = append(memberList, MemberInfo{
+			ID:          v.ID,
+			Addr:        v.Addr.String(),
+			Status:      v.Status,
+			Incarnation: v.Incarnation,
+		})
+	}
+	memberList = append(memberList, MemberInfo{
+		ID:          n.ID,
+		Addr:        n.BindAddr.String(),
+		Status:      StatusAlive,
+		Incarnation: n.Incarnation,
 	})
+	n.mu.Unlock() // release before blocking I/O
 
 	reply := &Message{
 		MessageType: "JOIN-ACK",
 		From:        n.BindAddr.String(),
-		Members:     members,
-		JoinerID: n.ID,
-		Counter: msg.Counter,
+		Members:     memberList,
+		JoinerID:    n.ID,
+		Counter:     msg.Counter,
 	}
 	value, err := json.Marshal(reply)
 	if err != nil {
-		log.Println(err)
+		log.Println("handleJoin: marshal failed:", err)
+		return
 	}
-
-	if _, err := n.conn.WriteToUDP(value, JoinerAddr); err != nil {
-		log.Println(err)
-	}
-
-	update:= Update{
-		MemberID: msg.JoinerID,
-		Status: StatusAlive,
-		Incarnation: 0,
+	if _, err := n.conn.WriteToUDP(value, joinerAddr); err != nil {
+		log.Println("handleJoin: write failed:", err)
 	}
 
 	n.updatesMu.Lock()
-	defer n.updatesMu.Unlock()
-
-	n.pendingUpdates = append(n.pendingUpdates, update)
-	
-
-
+	n.pendingUpdates = append(n.pendingUpdates, Update{
+		MemberID:    msg.JoinerID,
+		Status:      StatusAlive,
+		Incarnation: 1,
+	})
+	n.updatesMu.Unlock()
 }
 
+// handleJoinAck: lock ordering n.mu first, pendingJoinMu second.
 func (n *Node) handleJoinAck(msg Message) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-	for _, value := range msg.Members {
-		addr, err := net.ResolveUDPAddr("udp", value.Addr)
+	for _, v := range msg.Members {
+		if v.ID == n.ID {
+			continue
+		}
+		addr, err := net.ResolveUDPAddr("udp", v.Addr)
 		if err != nil {
-			log.Println(err)
+			log.Println("handleJoinAck: bad addr:", err)
+			continue
 		}
-		n.Members[value.ID] = &MemberState{
-			ID:          value.ID,
+		n.Members[v.ID] = &MemberState{
+			ID:          v.ID,
 			Addr:        addr,
-			Status:      value.Status,
-			Incarnation: value.Incarnation,
+			Status:      v.Status,
+			Incarnation: v.Incarnation,
 		}
 	}
+	n.mu.Unlock()
+
 	n.pendingJoinMu.Lock()
-	defer n.pendingJoinMu.Unlock()
-
-	waitCh, ok:= n.pendingJoin[msg.Counter]
-	if !ok{
-		return
+	waitCh, ok := n.pendingJoin[msg.Counter]
+	if ok {
+		delete(n.pendingJoin, msg.Counter)
+		close(waitCh)
 	}
-	close(waitCh)
-	
-
-	
-
+	n.pendingJoinMu.Unlock()
 }

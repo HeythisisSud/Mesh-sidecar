@@ -11,6 +11,7 @@ import (
 	pb "github.com/HeythisisSud/mesh-sidecar/raft/proto"
 )
 
+// callRequestVote does NOT hold n.mu across the blocking gRPC call.
 func (n *Node) callRequestVote(peer string, term, lastLogIndex, lastLogTerm uint64) bool {
 	conn, err := grpc.NewClient(peer, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -36,13 +37,10 @@ func (n *Node) callRequestVote(peer string, term, lastLogIndex, lastLogTerm uint
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
-	// if response has higher term, step down immediately
 	if resp.Term > n.currentTerm {
 		n.stepDown(resp.Term)
 		return false
 	}
-
 	return resp.VoteGranted
 }
 
@@ -58,12 +56,23 @@ func (n *Node) sendHeartbeats() {
 	}
 }
 
+// callAppendEntries does NOT hold n.mu across the blocking gRPC call.
+// If entries are supplied and the follower rejects due to log mismatch,
+// nextIndex is decremented and the call retried (standard Raft catch-up).
 func (n *Node) callAppendEntries(peer string, term, commitIndex uint64, entries []LogEntry) bool {
 	n.mu.Lock()
+	if n.nextIndex[peer] == 0 {
+		n.nextIndex[peer] = 1
+	}
 	prevLogIndex := n.nextIndex[peer] - 1
 	var prevLogTerm uint64
 	if prevLogIndex > 0 && prevLogIndex <= uint64(len(n.log)) {
 		prevLogTerm = n.log[prevLogIndex-1].Term
+	}
+	// If we have entries to send, include everything from prevLogIndex+1 onward.
+	if len(entries) > 0 && prevLogIndex+1 <= uint64(len(n.log)) {
+		entries = make([]LogEntry, len(n.log)-int(prevLogIndex))
+		copy(entries, n.log[prevLogIndex:])
 	}
 	n.mu.Unlock()
 
@@ -96,27 +105,32 @@ func (n *Node) callAppendEntries(peer string, term, commitIndex uint64, entries 
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
 	if resp.Term > n.currentTerm {
 		n.stepDown(resp.Term)
 		return false
 	}
-	if len(entries) > 0 {
-    log.Printf("[%s] callAppendEntries to %s: success=%v", n.id, peer, resp.Success)
-}
-
+	if !resp.Success && len(entries) > 0 && n.nextIndex[peer] > 1 {
+		// Log inconsistency: back up and will retry on next heartbeat.
+		n.nextIndex[peer]--
+	}
 	return resp.Success
 }
 
-// applyCommitted applies all committed but not yet applied log entries
-// to the state machine via ApplyCh.
+// applyCommitted applies committed-but-not-yet-applied entries to ApplyCh.
+//
+// CRITICAL: we snapshot the entries under the lock, then release the lock
+// BEFORE sending to ApplyCh. Sending to a buffered channel while holding
+// n.mu would deadlock if the channel fills (100 entries).
 func (n *Node) applyCommitted() {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
+	var toApply []LogEntry
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		entry := n.log[n.lastApplied-1]
+		toApply = append(toApply, n.log[n.lastApplied-1])
+	}
+	n.mu.Unlock()
+
+	for _, entry := range toApply {
 		n.ApplyCh <- entry
 	}
 }

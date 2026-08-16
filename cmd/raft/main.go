@@ -20,7 +20,7 @@ func startNode(id string, addr string, peers []string) (*raft.Node, *raft.KVStor
 
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("[%s] failed to listen: %v", id, addr, err)
+		log.Fatalf("[%s] failed to listen on %s: %v", id, addr, err)
 	}
 	srv := grpc.NewServer()
 	pb.RegisterRaftServiceServer(srv, raft.NewRaftServer(node))

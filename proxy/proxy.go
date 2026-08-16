@@ -5,34 +5,46 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"sort"
+	"sync/atomic"
 
 	"github.com/HeythisisSud/mesh-sidecar/members"
 )
 
+// NewProxy returns an HTTP handler that reverse-proxies requests to alive
+// cluster members in sorted round-robin order.
+// App-port convention: each member's HTTP server listens on gossipPort+1000.
 func NewProxy(node *members.Node) (http.Handler, error) {
+	var counter atomic.Uint64
 
-	proxy := &httputil.ReverseProxy{
+	p := &httputil.ReverseProxy{
 		Director: func(r *http.Request) {
-			for _, value := range node.SnapShot() {
-				if value.Status == "Alive" {
-					host, _, err := net.SplitHostPort(value.Addr.String())
-					if err!=nil{
-						continue
-					}
-					httpPort := value.Addr.Port + 1000
-					r.URL.Host = fmt.Sprintf("%s:%d", host, httpPort)
-					r.URL.Scheme = "http"
-					return
-
+			snapshot := node.SnapShot()
+			var alive []members.MemberState
+			for _, m := range snapshot {
+				if m.Status == members.StatusAlive {
+					alive = append(alive, m)
 				}
 			}
-			r.URL.Host = "" // deliberately invalid
-        	return
-
+			if len(alive) == 0 {
+				r.URL.Host = ""
+				return
+			}
+			sort.Slice(alive, func(i, j int) bool { return alive[i].ID < alive[j].ID })
+			idx := counter.Add(1) - 1
+			target := alive[idx%uint64(len(alive))]
+			host, _, err := net.SplitHostPort(target.Addr.String())
+			if err != nil {
+				r.URL.Host = ""
+				return
+			}
+			appPort := target.Addr.Port + 1000
+			r.URL.Host = fmt.Sprintf("%s:%d", host, appPort)
+			r.URL.Scheme = "http"
 		},
 	}
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-    http.Error(w, "no healthy backend available", http.StatusServiceUnavailable)
-}
-	return proxy, nil
+	p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		http.Error(w, "no healthy backend available", http.StatusServiceUnavailable)
+	}
+	return p, nil
 }
