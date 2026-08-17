@@ -72,7 +72,7 @@ func (n *Node) Start() {
 	go n.electionLoop()
 }
 
-// Stop shuts down the node safely. Safe to call multiple times.
+
 func (n *Node) Stop() {
 	n.stopOnce.Do(func() { close(n.done) })
 }
@@ -131,7 +131,7 @@ func (n *Node) startElection() {
 
 	log.Printf("[%s] starting election for term %d", n.id, term)
 
-	// Single-node cluster: win immediately with only the self-vote.
+	
 	if len(peers) == 0 {
 		n.becomeLeader(term)
 		return
@@ -173,7 +173,7 @@ func (n *Node) becomeLeader(term uint64) {
 	}
 }
 
-// lastLogInfo MUST be called with n.mu held.
+
 func (n *Node) lastLogInfo() (uint64, uint64) {
 	if len(n.log) == 0 {
 		return 0, 0
@@ -182,7 +182,7 @@ func (n *Node) lastLogInfo() (uint64, uint64) {
 	return uint64(len(n.log)), last.Term
 }
 
-// stepDown MUST be called with n.mu held.
+
 func (n *Node) stepDown(term uint64) {
 	n.currentTerm = term
 	n.state = Follower
@@ -190,7 +190,7 @@ func (n *Node) stepDown(term uint64) {
 	n.resetElectionTimeout()
 }
 
-// Submit proposes a command. Returns (logIndex, true) on success.
+
 func (n *Node) Submit(command string) (uint64, bool) {
 	n.mu.Lock()
 	if n.state != Leader {
@@ -205,8 +205,8 @@ func (n *Node) Submit(command string) (uint64, bool) {
 	commitIndex := n.commitIndex
 	n.mu.Unlock()
 
-	// Buffer == len(peers) so goroutines writing here never block even if
-	// Submit returns early, preventing goroutine leaks.
+	
+	
 	confirmCh := make(chan bool, len(peers))
 
 	for _, peer := range peers {
@@ -249,8 +249,8 @@ func (n *Node) Submit(command string) (uint64, bool) {
 	}
 	n.mu.Unlock()
 
-	// Apply OUTSIDE the mutex — applyCommitted must not send to ApplyCh
-	// while holding n.mu (would deadlock if channel is full).
+	
+	
 	go n.applyCommitted()
 
 	return index, true

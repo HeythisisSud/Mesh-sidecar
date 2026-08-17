@@ -54,7 +54,7 @@ func main() {
 
 	fmt.Println("started -- waiting for election...")
 
-	// find leader and submit KV operations
+	
 	go func() {
 		time.Sleep(500 * time.Millisecond)
 		for {
@@ -66,12 +66,12 @@ func main() {
 
 					kv.Set("x", "1")
 					kv.Set("y", "hello")
-					kv.Set("x", "2") // overwrite x
+					kv.Set("x", "2") 
 
-					// give followers time to apply
+					
 					time.Sleep(200 * time.Millisecond)
 
-					// read from all nodes -- should all agree
+					
 					for j, store := range kvStores {
 						snap := store.Snapshot()
 						fmt.Printf("[%s] state: %v\n", nodes[j].id, snap)

@@ -91,7 +91,7 @@ func (n *Node) Start() {
 	go n.gossipLoop()
 }
 
-// SnapShot returns a point-in-time copy of membership. Uses RLock because it is read-only.
+
 func (n *Node) SnapShot() []MemberState {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
@@ -114,8 +114,8 @@ func (n *Node) gossipLoop() {
 	}
 }
 
-// drainUpdates removes and returns a copy of all pending updates.
-// The returned slice is independent of pendingUpdates.
+
+
 func (n *Node) drainUpdates() []Update {
 	n.updatesMu.Lock()
 	defer n.updatesMu.Unlock()
@@ -148,8 +148,8 @@ func (n *Node) pickNextMember() *MemberState {
 	return m
 }
 
-// rebuildQueue MUST be called with n.mu held.
-// Lock ordering: n.mu -> updatesMu (consistent everywhere).
+
+
 func (n *Node) rebuildQueue() {
 	ids := make([]string, 0, len(n.Members))
 	for id := range n.Members {
@@ -166,7 +166,7 @@ func (n *Node) rebuildQueue() {
 	n.updatesMu.Unlock()
 }
 
-// buildUpdates MUST NOT be called while updatesMu is already held.
+
 func (n *Node) buildUpdates(status, memberID string, incarnation int) {
 	n.updatesMu.Lock()
 	defer n.updatesMu.Unlock()
@@ -338,13 +338,13 @@ func (n *Node) handleMessage(buf []byte, addr *net.UDPAddr) {
 	}
 }
 
-// mergeUpdates applies piggybacked updates. Lock ordering: n.mu -> updatesMu.
+
 func (n *Node) mergeUpdates(updates []Update) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	for _, u := range updates {
-		// Self-refutation: bump incarnation and re-assert Alive.
+		
 		if u.MemberID == n.ID && (u.Status == StatusSuspect || u.Status == StatusConfirm) {
 			n.Incarnation = u.Incarnation + 1
 			n.buildUpdates(StatusAlive, n.ID, n.Incarnation)
@@ -356,7 +356,7 @@ func (n *Node) mergeUpdates(updates []Update) {
 			continue
 		}
 
-		// Confirm: delete and continue — never touch the deleted struct.
+		
 		if u.Status == StatusConfirm {
 			delete(n.Members, u.MemberID)
 			continue
@@ -436,7 +436,7 @@ func (n *Node) handleAck(msg Message, addr *net.UDPAddr) {
 	if !ok {
 		return
 	}
-	// Guard against double-close (relay + direct ACK for same seq).
+	
 	select {
 	case <-waitCh:
 	default:
@@ -479,9 +479,9 @@ func (n *Node) Join(peerAddr *net.UDPAddr) error {
 	}
 }
 
-// handleJoin releases n.mu before the blocking WriteToUDP call to avoid
-// holding a lock across I/O. Lock ordering for updatesMu: only updatesMu
-// is acquired at the end, n.mu is already released.
+
+
+
 func (n *Node) handleJoin(msg Message) {
 	joinerAddr, err := net.ResolveUDPAddr("udp", msg.From)
 	if err != nil {
@@ -511,7 +511,7 @@ func (n *Node) handleJoin(msg Message) {
 		Status:      StatusAlive,
 		Incarnation: n.Incarnation,
 	})
-	n.mu.Unlock() // release before blocking I/O
+	n.mu.Unlock() 
 
 	reply := &Message{
 		MessageType: "JOIN-ACK",
@@ -538,7 +538,7 @@ func (n *Node) handleJoin(msg Message) {
 	n.updatesMu.Unlock()
 }
 
-// handleJoinAck: lock ordering n.mu first, pendingJoinMu second.
+
 func (n *Node) handleJoinAck(msg Message) {
 	n.mu.Lock()
 	for _, v := range msg.Members {

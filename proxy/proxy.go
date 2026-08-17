@@ -11,9 +11,9 @@ import (
 	"github.com/HeythisisSud/mesh-sidecar/members"
 )
 
-// NewProxy returns an HTTP handler that reverse-proxies requests to alive
-// cluster members in sorted round-robin order.
-// App-port convention: each member's HTTP server listens on gossipPort+1000.
+
+
+
 func NewProxy(node *members.Node) (http.Handler, error) {
 	var counter atomic.Uint64
 

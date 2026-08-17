@@ -1,8 +1,8 @@
-// mesh_test.go — single entry point to verify the full project.
-//
-//	go test ./... -v -timeout 90s -count=1
-//
-// No root, no kernel, loopback networking only.
+
+
+
+
+
 package main
 
 import (
@@ -26,7 +26,7 @@ import (
 	pb "github.com/HeythisisSud/mesh-sidecar/raft/proto"
 )
 
-// ── helpers ───────────────────────────────────────────────────────────────
+
 
 func mustUDPConn(t *testing.T) (*net.UDPConn, *net.UDPAddr) {
 	t.Helper()
@@ -68,8 +68,8 @@ func backendServer(t *testing.T, id string) *httptest.Server {
 	return s
 }
 
-// nodeFromBackends wires httptest servers into a SWIM Node's Members map.
-// gossip port = httpPort-1000 so proxy +1000 routes back to the real server.
+
+
 func nodeFromBackends(t *testing.T, servers []*httptest.Server, statuses []string) *members.Node {
 	t.Helper()
 	addr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
@@ -88,8 +88,8 @@ func nodeFromBackends(t *testing.T, servers []*httptest.Server, statuses []strin
 	return node
 }
 
-// raftCluster starts count Raft nodes wired via in-process gRPC on loopback ports.
-// Each node gets a KVStore that drains ApplyCh. Do NOT also drain ApplyCh in tests.
+
+
 func raftCluster(t *testing.T, count int) ([]*raft.Node, []*raft.KVStore) {
 	t.Helper()
 	listeners := make([]net.Listener, count)
@@ -141,8 +141,8 @@ func findLeader(t *testing.T, nodes []*raft.Node, d time.Duration) int {
 	return idx
 }
 
-// raftClusterWithStop returns nodes, kvs, and a stopNode(i) function that stops
-// both the raft node loop AND the gRPC server for node i, simulating a hard crash.
+
+
 func raftClusterWithStop(t *testing.T, count int) ([]*raft.Node, []*raft.KVStore, func(int)) {
 	t.Helper()
 	listeners := make([]net.Listener, count)
@@ -186,7 +186,7 @@ func raftClusterWithStop(t *testing.T, count int) ([]*raft.Node, []*raft.KVStore
 	}
 }
 
-// ── SWIM tests ────────────────────────────────────────────────────────────
+
 
 func TestSWIM_NodeCreation(t *testing.T) {
 	conn, addr := mustUDPConn(t)
@@ -257,7 +257,7 @@ func TestSWIM_Snapshot(t *testing.T) {
 	n.Members["p"] = &members.MemberState{ID: "p", Addr: peer, Status: members.StatusAlive}
 
 	snap := n.SnapShot()
-	snap[0].Status = members.StatusConfirm // mutate copy
+	snap[0].Status = members.StatusConfirm 
 
 	if n.SnapShot()[0].Status != members.StatusAlive {
 		t.Error("SnapShot is not a copy — mutation affected live state")
@@ -284,7 +284,7 @@ func TestSWIM_MergeUpdates_Confirm(t *testing.T) {
 	peer, _ := net.ResolveUDPAddr("udp", "127.0.0.1:21000")
 	n.Members["doomed"] = &members.MemberState{ID: "doomed", Addr: peer, Status: members.StatusSuspect, Incarnation: 1}
 
-	// Confirm removes from map; the continue-after-delete ensures no field write crash.
+	
 	delete(n.Members, "doomed")
 	if _, ok := n.Members["doomed"]; ok {
 		t.Error("Confirm update must remove member from map")
@@ -299,7 +299,7 @@ func TestSWIM_MergeUpdates_SelfRefutation(t *testing.T) {
 	}
 }
 
-// ── Proxy tests ───────────────────────────────────────────────────────────
+
 
 func TestProxy_SingleBackend(t *testing.T) {
 	be := backendServer(t, "hello")
@@ -387,13 +387,13 @@ func TestProxy_SpreadAcrossAliveBackends(t *testing.T) {
 	}
 }
 
-// ── Raft tests ────────────────────────────────────────────────────────────
+
 
 func TestRaft_ElectionSingleNode(t *testing.T) {
 	n := raft.NewNode("solo", []string{})
 	n.Start()
 	t.Cleanup(n.Stop)
-	// Election timeout is 150-300ms; give a comfortable 1s margin.
+	
 	if !waitFor(t, 1*time.Second, func() bool {
 		s, _ := n.Status()
 		return s == "Leader"
@@ -469,8 +469,8 @@ func TestRaft_LogReplication(t *testing.T) {
 		}
 	}
 
-	// Verify via KV state machine — it drains ApplyCh internally.
-	// After Submit returns the leader has committed; followers apply via heartbeats.
+	
+	
 	if !waitFor(t, 5*time.Second, func() bool {
 		for _, kv := range kvs {
 			if _, ok := kv.Get("a"); !ok {
@@ -511,24 +511,24 @@ func TestRaft_NoCommitWithoutMajority(t *testing.T) {
 	nodes, _, stopNode := raftClusterWithStop(t, 3)
 	idx := findLeader(t, nodes, 2*time.Second)
 
-	// Stop BOTH followers. majority = (2+1)/2+1 = 2.
-	// With both peers unreachable, confirmCh gets 0 successes so confirmed=1 < 2.
+	
+	
 	for i := range nodes {
 		if i != idx {
 			stopNode(i)
 		}
 	}
-	// Wait well past the gRPC 100ms timeout so the connections are definitely dead.
+	
 	time.Sleep(300 * time.Millisecond)
 
-	// Submit must time out waiting for majority (2 of 3) and return false.
+	
 	_, ok := nodes[idx].Submit("SET no-majority yes")
 	if ok {
 		t.Error("Submit must not commit without majority (2 of 3 required, only 1 available)")
 	}
 }
 
-// ── KV store tests ────────────────────────────────────────────────────────
+
 
 func TestKV_SetAndGet(t *testing.T) {
 	nodes, kvs := raftCluster(t, 3)
@@ -568,7 +568,7 @@ func TestKV_Delete(t *testing.T) {
 	nodes, kvs := raftCluster(t, 3)
 	idx := findLeader(t, nodes, 2*time.Second)
 	kvs[idx].Set("y", "hello")
-	// Wait for set to propagate before deleting
+	
 	waitFor(t, 2*time.Second, func() bool {
 		for _, kv := range kvs {
 			if _, ok := kv.Get("y"); !ok {
@@ -590,7 +590,7 @@ func TestKV_Delete(t *testing.T) {
 
 func TestKV_ConsistentState(t *testing.T) {
 	nodes, kvs := raftCluster(t, 3)
-	// Find leader once; it will remain stable while all nodes are running.
+	
 	lidx := findLeader(t, nodes, 2*time.Second)
 	for i := 0; i < 10; i++ {
 		if err := kvs[lidx].Set(fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i)); err != nil {
@@ -598,7 +598,7 @@ func TestKV_ConsistentState(t *testing.T) {
 		}
 	}
 
-	// Wait for all nodes to converge.
+	
 	if !waitFor(t, 3*time.Second, func() bool {
 		for _, kv := range kvs {
 			snap := kv.Snapshot()
@@ -625,7 +625,7 @@ func TestKV_ConsistentState(t *testing.T) {
 		}
 	}
 
-	// Verify Snapshot is a copy.
+	
 	snap := kvs[0].Snapshot()
 	snap["injected"] = "ghost"
 	if _, ok := kvs[0].Get("injected"); ok {
@@ -647,7 +647,7 @@ func TestKV_NotLeaderReturnsError(t *testing.T) {
 	}
 }
 
-// sortedKeys is a utility kept to silence unused import warnings if needed.
+
 var _ = func() []string {
 	m := map[string]string{"a": "1"}
 	ks := make([]string, 0)

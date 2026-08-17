@@ -17,7 +17,7 @@ func NewKVStore(node *Node) *KVStore {
 		data: make(map[string]string),
 		node: node,
 	}
-	// start applying committed entries from the node's ApplyCh
+	
 	go kv.applyLoop()
 	return kv
 }

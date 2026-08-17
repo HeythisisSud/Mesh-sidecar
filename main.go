@@ -46,7 +46,7 @@ func main() {
 	node := members.NewNode(*id, bindAddr, conn)
 	node.Start()
 
-	// Declare redirector before signal goroutine so the closure can capture it.
+	
 	var redirector *meshebpf.Redirector
 
 	sigCh := make(chan os.Signal, 1)
@@ -61,7 +61,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Fake app backend — represents "the real service" on this node.
+	
 	appPort := bindAddr.Port + 1000
 	go func() {
 		if err := http.ListenAndServe(fmt.Sprintf(":%d", appPort), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -71,7 +71,7 @@ func main() {
 		}
 	}()
 
-	// L7 proxy — Phase 2.
+	
 	proxyHandler, err := proxy.NewProxy(node)
 	if err != nil {
 		log.Fatalf("failed to create proxy: %v", err)
@@ -83,7 +83,7 @@ func main() {
 		}
 	}()
 
-	// L4 eBPF redirector — Phase 3, optional.
+	
 	if *useEBPF {
 		cgroupPath, err := meshebpf.DefaultCgroupPath()
 		if err != nil {
@@ -105,7 +105,7 @@ func main() {
 		}()
 	}
 
-	// Status endpoint — useful for debugging.
+	
 	statusPort := bindAddr.Port + 3000
 	go func() {
 		mux := http.NewServeMux()
@@ -149,8 +149,8 @@ func main() {
 	}
 }
 
-// syncRedirectMap pushes the current alive member list into the BPF redirect map.
-// selfID and selfAddr are injected because node.SnapShot() only returns remote peers.
+
+
 func syncRedirectMap(r *meshebpf.Redirector, node *members.Node, selfID string, selfAddr *net.UDPAddr) {
 	snapshot := node.SnapShot()
 	snapshot = append(snapshot, members.MemberState{
